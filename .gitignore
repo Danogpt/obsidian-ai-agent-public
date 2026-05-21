@@ -1,0 +1,33 @@
+Change-Audit.md
+Change.md
+todo.md
+
+# local Obsidian plugin runtime data
+data.json
+vault-index.json
+vector-index.json
+
+# nested plugin workspace runtime data
+plugin/data.json
+plugin/vault-index.json
+plugin/vector-index.json
+
+# build artifacts
+main.js
+*.map
+plugin/main.js
+plugin/*.map
+dist/
+coverage/
+.vitest/
+plugin/dist/
+plugin/coverage/
+plugin/.vitest/
+
+# dependencies
+node_modules/
+plugin/node_modules/
+
+# OS files
+.DS_Store
+Thumbs.db

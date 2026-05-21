@@ -1,0 +1,11 @@
+{
+	"id": "obsidian-ai-agent",
+	"name": "Obsidian AI Agent",
+	"version": "0.1.0",
+	"minAppVersion": "1.5.0",
+	"description": "Right sidebar AI agent for Obsidian with local backend, OpenAI/Claude/ollama support and Vault context.",
+	"author": "Danio Gasparro",
+	"authorUrl": "https://assetdepth.com/",
+	"fundingUrl": "https://assetdepth.com/",
+	"isDesktopOnly": true
+}
