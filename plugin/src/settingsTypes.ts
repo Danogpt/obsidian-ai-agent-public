@@ -1,5 +1,6 @@
-import type { CustomModelConfig } from './models/modelRegistry';
+import { DEFAULT_MODEL_ID, type CustomModelConfig } from './models/modelRegistry';
 import type { AgentMode } from './tools/toolTypes';
+import type { UIMode } from './chat/chatStore';
 
 // ── Profile types ────────────────────────────────────────────────
 
@@ -27,6 +28,13 @@ export type AnswerPreference =
 	| 'structured_analysis'
 	| 'implementation_first'
 	| 'draft_first';
+
+export interface LearnedIntentPattern {
+	key: string;
+	example: string;
+	counts: Partial<Record<UIMode, number>>;
+	updatedAt: number;
+}
 
 // ── Settings interface ───────────────────────────────────────────
 
@@ -60,6 +68,8 @@ export interface AiAgentSettings {
 	embeddingBackend: 'local' | 'openai' | 'gemini' | 'ollama';
 	enableStyleCritique: boolean;
 	enableLlmRerank: boolean;
+	enableIntentClassifier: boolean;
+	learnedIntentPatterns: LearnedIntentPattern[];
 }
 
 export const DEFAULT_SETTINGS: AiAgentSettings = {
@@ -68,7 +78,7 @@ export const DEFAULT_SETTINGS: AiAgentSettings = {
 	geminiApiKey: '',
 	ollamaBaseUrl: 'http://127.0.0.1:11434',
 
-	lastSelectedModelId: 'gpt-5.5',
+	lastSelectedModelId: DEFAULT_MODEL_ID,
 	autoSendActiveNote: true,
 
 	agentMode: 'suggest',
@@ -91,6 +101,8 @@ export const DEFAULT_SETTINGS: AiAgentSettings = {
 	embeddingBackend: 'local',
 	enableStyleCritique: true,
 	enableLlmRerank: false,
+	enableIntentClassifier: true,
+	learnedIntentPatterns: [],
 };
 
 // ── Style profile builder ────────────────────────────────────────

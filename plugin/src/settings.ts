@@ -55,26 +55,29 @@ export class AiAgentSettingsTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName('OpenAI')
+			.setDesc('Wird lokal auf diesem Gerät gespeichert und nicht mit dem Vault synchronisiert.')
 			.addText(t => {
 				t.inputEl.type = 'password';
-				t.setPlaceholder('sk-…').setValue(this.plugin.settings.openaiApiKey)
-					.onChange(async v => { this.plugin.settings.openaiApiKey = v; await this.plugin.saveSettings(); });
+				t.setPlaceholder('sk-…').setValue(this.plugin.getProviderApiKey('openai'))
+					.onChange(async v => { this.plugin.setProviderApiKey('openai', v); await this.plugin.saveSettings(); });
 			});
 
 		new Setting(containerEl)
 			.setName('Anthropic')
+			.setDesc('Wird lokal auf diesem Gerät gespeichert und nicht mit dem Vault synchronisiert.')
 			.addText(t => {
 				t.inputEl.type = 'password';
-				t.setPlaceholder('sk-ant-…').setValue(this.plugin.settings.anthropicApiKey)
-					.onChange(async v => { this.plugin.settings.anthropicApiKey = v; await this.plugin.saveSettings(); });
+				t.setPlaceholder('sk-ant-…').setValue(this.plugin.getProviderApiKey('anthropic'))
+					.onChange(async v => { this.plugin.setProviderApiKey('anthropic', v); await this.plugin.saveSettings(); });
 			});
 
 		new Setting(containerEl)
 			.setName('Google Gemini')
+			.setDesc('Wird lokal auf diesem Gerät gespeichert und nicht mit dem Vault synchronisiert.')
 			.addText(t => {
 				t.inputEl.type = 'password';
-				t.setPlaceholder('AIza…').setValue(this.plugin.settings.geminiApiKey)
-					.onChange(async v => { this.plugin.settings.geminiApiKey = v; await this.plugin.saveSettings(); });
+				t.setPlaceholder('AIza…').setValue(this.plugin.getProviderApiKey('gemini'))
+					.onChange(async v => { this.plugin.setProviderApiKey('gemini', v); await this.plugin.saveSettings(); });
 			});
 
 		// ── Ollama ───────────────────────────────────────────────
@@ -126,6 +129,12 @@ export class AiAgentSettingsTab extends PluginSettingTab {
 			.setName('Aktive Notiz automatisch mitsenden')
 			.addToggle(t => t.setValue(this.plugin.settings.autoSendActiveNote)
 				.onChange(async v => { this.plugin.settings.autoSendActiveNote = v; await this.plugin.saveSettings(); }));
+
+		new Setting(containerEl)
+			.setName('Intent-Classifier Fallback')
+			.setDesc('Fragt bei unklaren Formulierungen ein kleines Modell-Routing an und lernt lokale Formulierungsmuster.')
+			.addToggle(t => t.setValue(this.plugin.settings.enableIntentClassifier)
+				.onChange(async v => { this.plugin.settings.enableIntentClassifier = v; await this.plugin.saveSettings(); }));
 
 		// ── Schreibprofil ─────────────────────────────────────────
 		this.addHeading(containerEl, 'Schreibprofil');

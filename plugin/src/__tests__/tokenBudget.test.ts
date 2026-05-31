@@ -36,10 +36,44 @@ describe('compactContextForBudget — normal mode', () => {
 		expect(JSON.stringify(result).length).toBeLessThanOrEqual(5000);
 	});
 
+	it('never degrades strong file context to outline, even when it must shrink', () => {
+		const content = Array.from({ length: 120 }, (_, i) => `## Section ${i}\n${'detail '.repeat(80)}`).join('\n');
+		const result = compactContextForBudget([item('active_file', content)], 5000, { intent: 'fact_lookup', query: 'unmatched query terms' });
+		const resultContent = result[0]?.content ?? '';
+		expect(resultContent.length).toBeGreaterThan(1000);
+		expect(resultContent).not.toContain('[outline mode]');
+	});
+
 	it('returns items within budget unchanged', () => {
 		const items: ContextItem[] = [item('active_file', 'short content')];
 		const result = compactContextForBudget(items, 100000);
 		expect(result.length).toBe(1);
+	});
+
+	it('keeps normal active file content instead of degrading to outline when it fits', () => {
+		const content = '# Gliederung\n\n' + 'Absatz mit Details.\n'.repeat(320);
+		const result = compactContextForBudget([item('active_file', content)], 100000, { intent: 'fact_lookup' });
+		expect(result[0]?.content).toBe(content);
+		expect(result[0]?.content).not.toContain('[outline mode]');
+	});
+
+	it('keeps manually referenced file content instead of outline when it fits', () => {
+		const content = '# Quelle\n\n' + 'Empirische Arbeit Details.\n'.repeat(320);
+		const result = compactContextForBudget([item('input_reference', content)], 100000, { intent: 'fact_lookup' });
+		expect(result[0]?.content).toBe(content);
+		expect(result[0]?.content).not.toContain('[outline mode]');
+	});
+
+	it('gives strong active file context dynamic budget before secondary context', () => {
+		const active = '# Active\n\n' + 'important active file content\n'.repeat(500);
+		const items: ContextItem[] = [
+			item('agent_md', 'agent instructions\n'.repeat(500)),
+			item('active_file', active),
+		];
+		const result = compactContextForBudget(items, 18000, { intent: 'fact_lookup', query: 'important active' });
+		const activeContent = result.find(i => i.type === 'active_file')?.content ?? '';
+		expect(activeContent.length).toBeGreaterThan(10000);
+		expect(activeContent).not.toContain('[outline mode]');
 	});
 });
 
@@ -94,15 +128,26 @@ describe('compactContextForBudget — edit mode', () => {
 		const result = compactContextForBudget(items, 100000, { intent: 'fact_lookup' });
 		expect(result.filter(i => i.type === 'retrieved_chunk' && i.path === 'same.md').length).toBe(3);
 	});
+
+	it('respects explicit maxRetrievedChunks from router policy', () => {
+		const items: ContextItem[] = [
+			item('retrieved_chunk', 'chunk 1', 'a.md'),
+			item('retrieved_chunk', 'chunk 2', 'b.md'),
+			item('retrieved_chunk', 'chunk 3', 'c.md'),
+		];
+		const result = compactContextForBudget(items, 100000, { intent: 'fact_lookup', maxRetrievedChunks: 1 });
+		expect(result.filter(i => i.type === 'retrieved_chunk').length).toBe(1);
+	});
 });
 
-describe('compactContextForBudget — focused degradation', () => {
-	it('applies focused mode to active_file in edit intent', () => {
+describe('compactContextForBudget — edit target preservation', () => {
+	it('keeps active_file complete in edit intent when it fits the edit target cap', () => {
 		const longContent = Array.from({ length: 30 }, (_, i) => `## Section ${i}\n${'content '.repeat(50)}`).join('\n');
 		const items: ContextItem[] = [item('active_file', longContent)];
 		const result = compactContextForBudget(items, 200000, { intent: 'edit', query: 'Section 15' });
 		const resultContent = result[0]?.content ?? '';
-		// Focused mode should produce content that mentions the query section
-		expect(resultContent).toContain('Section');
+		expect(resultContent).toBe(longContent);
+		expect(resultContent).not.toContain('[outline mode]');
+		expect(resultContent).not.toContain('[focused mode]');
 	});
 });

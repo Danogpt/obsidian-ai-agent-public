@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { buildWorkingMemoryContext, recordToolOutcome } from '../context/contextMemory';
+import { buildWorkingMemoryContext, compactToolResults, recordToolOutcome } from '../context/contextMemory';
 import type { ChatThread } from '../chat/chatStore';
 
 function makeThread(): ChatThread {
@@ -82,5 +82,38 @@ describe('recordToolOutcome', () => {
 		expect(context.length).toBe(2);
 		expect(context[0]?.content).toContain('notes/target.md');
 		expect(context[1]?.content).toContain('path: notes/target.md');
+	});
+});
+
+describe('compactToolResults', () => {
+	it('keeps all tool outputs from the latest OpenAI response together', () => {
+		const compacted = compactToolResults([
+			{ id: 'old_1', tool: 'read_folder', provider_context: { openai_response_id: 'resp_old' }, ok: true, result: 'old' },
+			{ id: 'old_2', tool: 'search_vault', provider_context: { openai_response_id: 'resp_old' }, ok: true, result: 'old' },
+			{ id: 'call_1', tool: 'read_file', provider_context: { openai_response_id: 'resp_latest' }, ok: true, result: '1' },
+			{ id: 'call_2', tool: 'read_file', provider_context: { openai_response_id: 'resp_latest' }, ok: true, result: '2' },
+			{ id: 'call_3', tool: 'read_file', provider_context: { openai_response_id: 'resp_latest' }, ok: true, result: '3' },
+			{ id: 'call_4', tool: 'read_file', provider_context: { openai_response_id: 'resp_latest' }, ok: true, result: '4' },
+			{ id: 'loop_guard_readonly_3', tool: 'loop_guard', ok: false, error: 'Too many read-only rounds.' },
+		]);
+
+		expect(compacted.map(result => result.id)).toEqual([
+			'call_1',
+			'call_2',
+			'call_3',
+			'call_4',
+			'loop_guard_readonly_3',
+		]);
+	});
+
+	it('still limits ordinary tool history when no OpenAI response group is pending', () => {
+		const compacted = compactToolResults([
+			{ id: 'a', tool: 'read_file', ok: true, result: 'a' },
+			{ id: 'b', tool: 'read_file', ok: true, result: 'b' },
+			{ id: 'c', tool: 'read_file', ok: true, result: 'c' },
+			{ id: 'd', tool: 'read_file', ok: true, result: 'd' },
+		]);
+
+		expect(compacted.map(result => result.id)).toEqual(['b', 'c', 'd']);
 	});
 });

@@ -1,12 +1,36 @@
 import { requestUrl } from 'obsidian';
 
+const SECRET_QUERY_KEYS = new Set(['key', 'api_key', 'apikey', 'token', 'access_token']);
+
+export function redactUrlSecrets(input: string): string {
+	try {
+		const url = new URL(input);
+		let changed = false;
+		for (const key of Array.from(url.searchParams.keys())) {
+			if (SECRET_QUERY_KEYS.has(key.toLowerCase())) {
+				url.searchParams.set(key, '[redacted]');
+				changed = true;
+			}
+		}
+		return changed ? url.toString() : input;
+	} catch {
+		return input;
+	}
+}
+
+export function redactSecretLikeText(message: string): string {
+	return message
+		.replace(/([?&](?:key|api_key|apikey|token|access_token)=)[^&\s"']+/gi, '$1[redacted]')
+		.replace(/(AIza[0-9A-Za-z_-]{10,})/g, '[redacted-gemini-key]');
+}
+
 export class ProviderError extends Error {
 	constructor(
 		public readonly provider: string,
 		public readonly status: number,
 		message: string,
 	) {
-		super(`${provider} ${status}: ${message}`);
+		super(`${provider} ${status}: ${redactSecretLikeText(message)}`);
 		this.name = 'ProviderError';
 	}
 }

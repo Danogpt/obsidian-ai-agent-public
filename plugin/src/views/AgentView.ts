@@ -1,13 +1,19 @@
 /* eslint-disable obsidianmd/ui/sentence-case */
 
-import { ItemView, MarkdownRenderer, Modal, TFile, WorkspaceLeaf } from 'obsidian';
+import { ItemView, MarkdownRenderer, Modal, TFile, WorkspaceLeaf, setIcon } from 'obsidian';
 import type ObsidianAiAgentPlugin from '../main';
 import type { ProviderName } from '../settings';
 import {
 	getAllModels,
+	describeModelReasoning,
+	getModelApiId,
+	getModelAvailability,
 	getModelConfigWithCustom,
+	getModelSourceUrl,
 	getRecommendedModels,
 	getModelsByProvider,
+	isReasoningActive,
+	legacyThinkingReasoning,
 } from '../models/modelRegistry';
 import type { ChatRequestPayload, ContextItem, EditPlan, TaskPlan, ToolResult, TypedStep, TaskComplexity } from '../agent/types';
 import { buildSystemPrompt, parseStructuredEditPlan, parseTaskPlan } from '../agent/prompts';
@@ -15,8 +21,21 @@ import { postCheckAssistantAnswer } from '../agent/postCheck';
 import { advanceTaskPlan, buildFallbackPlan, classifyTaskComplexity, shouldReplanFromToolResults, shouldUsePlanner } from '../agent/planner';
 import { callProvider } from '../providers/router';
 import { ProviderError } from '../providers/http';
+import { formatProviderUsage } from '../providers/usage';
 import { buildStyleProfile } from '../settings';
-import type { ChatMessage, ChatThread, ContextMode } from '../chat/chatStore';
+import type { ChatMessage, ChatThread, ContextMode, UIMode } from '../chat/chatStore';
+import { getEffectiveModes, setEffectiveModes } from '../chat/chatStore';
+import { parseSlashCommand, routeIntent } from '../agent/intentRouter';
+import type { RouterResult } from '../agent/intentRouter';
+import { buildPendingPlanContext, clonePendingTaskPlan, isPendingPlanExecutionRequest, isPendingPlanRevisionRequest } from '../agent/pendingPlan';
+import {
+	applyClassifierResult,
+	buildIntentClassifierPrompt,
+	learnIntentPattern,
+	parseIntentClassifierResult,
+	shouldRunIntentClassifier,
+} from '../agent/intentClassifier';
+import { buildContextDebugSnapshot, type ContextDebugSnapshot } from '../context/contextDebug';
 import { buildCompactHistory, buildWorkingMemoryContext, compactToolResults, recordToolOutcome, refreshWorkingSummary } from '../context/contextMemory';
 import { ContextResolver } from '../context/contextResolver';
 import { defaultMaxContextChars, defaultMaxOutputTokens, getRateLimitProfile } from '../limits/rateLimitProfiles';
@@ -34,11 +53,17 @@ import {
 	READ_ONLY_TOOLS,
 	METADATA_ONLY_TOOLS,
 	WRITE_TOOLS,
+	getEditReadLoopGuard,
 	getDuplicateReadGuard,
 	getRoundLoopGuard,
 	getReadPaths,
 	getSearchResultCount,
 	hasFreshReadForPath,
+	hasExplicitBroadDiscoveryIntent,
+	isLikelyNewFileCreationIntent,
+	validateReadFolderScope,
+	getLatestReadContentForPath,
+	validateOverwriteContentSafety,
 } from './agentGuards';
 
 const PROVIDER_GROUPS: { label: string; provider: ProviderName }[] = [
@@ -125,6 +150,7 @@ export class AgentView extends ItemView {
 	private toolExecutor: ToolExecutor;
 
 	private currentScreen: Screen = 'chat';
+	private showArchive = false;
 
 	private options = { webSearch: false, thinkingMode: false, vaultTools: true };
 	private isLoading = false;
@@ -246,13 +272,34 @@ export class AgentView extends ItemView {
 				this.currentScreen = 'chat';
 				this.render();
 			});
-			const archBtn = row.createEl('button', { cls: 'ai-agent-thread-archive-btn', text: '×', attr: { title: 'Archivieren' } });
+			const archBtn = row.createEl('button', { cls: 'ai-agent-thread-archive-btn', attr: { title: 'Archivieren' } });
+			setIcon(archBtn, 'archive');
 			archBtn.addEventListener('click', e => { e.stopPropagation(); void this.plugin.archiveThread(t.id).then(() => this.render()); });
 		}
 
-		const total = this.plugin.chatStore.threads.length;
-		const archived = this.plugin.chatStore.threads.filter(t => t.archived).length;
-		if (total > 0) root.createDiv({ cls: 'ai-agent-view-all', text: archived > 0 ? `Archiv (${archived})` : `Alle Chats (${total})` });
+		const archivedThreads = this.plugin.chatStore.threads.filter(t => t.archived).sort((a, b) => b.updatedAt - a.updatedAt);
+		if (archivedThreads.length > 0) {
+			const archiveSection = root.createDiv('ai-agent-archive-section');
+			const archiveHeader = archiveSection.createDiv('ai-agent-archive-header');
+			archiveHeader.createSpan({ cls: 'ai-agent-archive-toggle', text: this.showArchive ? '▾' : '▸' });
+			archiveHeader.createSpan({ cls: 'ai-agent-archive-label', text: `Archiv (${archivedThreads.length})` });
+			archiveHeader.addEventListener('click', () => { this.showArchive = !this.showArchive; this.render(); });
+
+			if (this.showArchive) {
+				const archiveList = archiveSection.createDiv('ai-agent-archive-list');
+				for (const t of archivedThreads) {
+					const row = archiveList.createDiv('ai-agent-thread-row');
+					row.createDiv({ cls: 'ai-agent-thread-title', text: t.title || 'Untitled' });
+					row.createDiv({ cls: 'ai-agent-thread-age', text: this.relativeTime(t.updatedAt) });
+					const restoreBtn = row.createEl('button', { cls: 'ai-agent-thread-restore-btn', attr: { title: 'Wiederherstellen' } });
+					setIcon(restoreBtn, 'undo');
+					restoreBtn.addEventListener('click', (e: MouseEvent) => { e.stopPropagation(); void this.plugin.unarchiveThread(t.id).then(() => this.render()); });
+					const deleteBtn = row.createEl('button', { cls: 'ai-agent-thread-delete-btn', attr: { title: 'Löschen' } });
+					setIcon(deleteBtn, 'trash');
+					deleteBtn.addEventListener('click', (e: MouseEvent) => { e.stopPropagation(); void this.plugin.deleteThread(t.id).then(() => this.render()); });
+				}
+			}
+		}
 	}
 
 	// ── Composer ───────────────────────────────────────────────
@@ -262,7 +309,7 @@ export class AgentView extends ItemView {
 
 		this.inputEl = composer.createEl('textarea', {
 			cls: 'ai-agent-input',
-			attr: { placeholder: 'Ask anything… (Enter = Send, Shift+Enter = newline)' },
+			attr: { placeholder: this.modeInputPlaceholder('ask') },
 		});
 		this.inputEl.addEventListener('input', () => {
 			this.resizeComposerInput();
@@ -277,15 +324,6 @@ export class AgentView extends ItemView {
 		ctxBtn.addEventListener('click', () => this.togglePopover(ctxBtn, p => this.fillContextPopover(p, thread)));
 		const optBtn = bar.createEl('button', { cls: 'ai-agent-icon-btn', text: '⚙', attr: { title: 'Optionen' } });
 		optBtn.addEventListener('click', () => this.togglePopover(optBtn, p => this.fillOptionsPopover(p)));
-
-		// Agent mode chip — right of gear
-		const agentModeLabel: Record<string, string> = { read: 'Lesen', suggest: 'Vorschlag', agent: 'Agent' };
-		const agentModeIcon: Record<string, string> = { read: '👁', suggest: '✎', agent: '⚡' };
-		const am = this.plugin.settings.agentMode ?? 'suggest';
-		const modeChip = bar.createDiv('ai-agent-mode-pill');
-		modeChip.title = 'Agent Modus (in Einstellungen ändern)';
-		modeChip.createSpan({ text: agentModeIcon[am] ?? '⚙' });
-		modeChip.createSpan({ text: ' ' + (agentModeLabel[am] ?? am) });
 
 		bar.createDiv('ai-agent-spacer');
 
@@ -333,43 +371,60 @@ export class AgentView extends ItemView {
 		popover.addClass('ai-agent-ctx-popover');
 		popover.createEl('p', { text: 'Kontext', cls: 'ai-agent-popover-title' });
 
-		const modes: ContextMode[] = ['active_file', 'selected_text', 'manual_files', 'folder', 'vault', 'none'];
-
-		// Folder path input (shown when folder mode is active)
+		const ALL_MODES: ContextMode[] = ['active_file', 'selected_text', 'manual_files', 'folder', 'vault', 'none'];
 		let folderInputRow: HTMLElement | null = null;
 
-		const setMode = async (mode: ContextMode) => {
-			thread.contextMode = mode;
-			thread.updatedAt = Date.now();
-			await this.plugin.saveAll();
-			renderModeOptions();
+		const save = async () => { thread.updatedAt = Date.now(); await this.plugin.saveAll(); };
+
+		const toggleMode = async (mode: ContextMode, checked: boolean) => {
+			if (mode === 'none') {
+				setEffectiveModes(thread, checked ? ['none'] : ['active_file']);
+			} else {
+				let modes = getEffectiveModes(thread).filter(m => m !== 'none' && m !== mode);
+				if (checked) modes.push(mode);
+				setEffectiveModes(thread, modes.length ? modes : ['active_file']);
+			}
+			await save();
+			renderCheckboxes();
+			// show/hide folder input
 			folderInputRow?.remove();
 			folderInputRow = null;
-			if (mode === 'folder') showFolderInput();
-			if (mode === 'manual_files') {
-				this.closePopover();
-				new MultiFileModal(this.app, thread.manualFilePaths ?? [], (paths) => {
-					void (async () => {
-						thread.manualFilePaths = paths;
-						thread.updatedAt = Date.now();
-						await this.plugin.saveAll();
-					})();
-				}).open();
-			}
+			if (getEffectiveModes(thread).includes('folder')) showFolderInput();
 		};
 
-		const optionsContainer = popover.createDiv();
+		const checkboxContainer = popover.createDiv('ai-agent-ctx-modes');
 
-		const renderModeOptions = () => {
-			optionsContainer.empty();
-			for (const mode of modes) {
-				const row = optionsContainer.createDiv('ai-agent-mode-option');
-				const radio = row.createDiv('ai-agent-mode-radio');
-				const active = (thread.contextMode ?? 'active_file') === mode;
-				if (active) { row.addClass('is-active'); radio.addClass('is-active'); }
-				row.createSpan({ text: CONTEXT_MODE_LABELS[mode] });
-				row.addEventListener('click', () => {
-					void setMode(mode);
+		const renderCheckboxes = () => {
+			checkboxContainer.empty();
+			const active = getEffectiveModes(thread);
+			const noneSelected = active.includes('none');
+			for (const mode of ALL_MODES) {
+				const row = checkboxContainer.createDiv('ai-agent-mode-option');
+				const cb = row.createEl('input', { attr: { type: 'checkbox' } }) as HTMLInputElement;
+				cb.checked = active.includes(mode);
+				if (mode !== 'none' && noneSelected) cb.disabled = true;
+				const labelEl = row.createSpan({ text: CONTEXT_MODE_LABELS[mode] });
+				if (mode === 'manual_files' && thread.manualFilePaths?.length) {
+					labelEl.createSpan({ cls: 'ai-ctx-count', text: ` (${thread.manualFilePaths.length})` });
+				}
+				cb.addEventListener('change', () => {
+					void (async () => {
+						if (mode === 'manual_files' && cb.checked) {
+							this.closePopover();
+							new MultiFileModal(this.app, thread.manualFilePaths ?? [], async (paths) => {
+								thread.manualFilePaths = paths;
+								const modes: ContextMode[] = getEffectiveModes(thread).filter(m => m !== 'none' && m !== 'manual_files');
+								if (paths.length) modes.push('manual_files');
+								setEffectiveModes(thread, modes.length ? modes : ['active_file']);
+								await save();
+							}).open();
+						} else {
+							await toggleMode(mode, cb.checked);
+						}
+					})();
+				});
+				row.addEventListener('click', e => {
+					if (e.target !== cb) { cb.checked = !cb.checked; cb.dispatchEvent(new Event('change')); }
 				});
 			}
 		};
@@ -381,7 +436,6 @@ export class AgentView extends ItemView {
 				attr: { type: 'text', placeholder: 'Ordner-Pfad…', value: thread.folderPath ?? '' },
 			});
 			const resultEl = folderInputRow.createDiv('ai-agent-ctx-file-list');
-
 			const renderFolders = (q: string) => {
 				resultEl.empty();
 				const seen = new Set<string>();
@@ -389,38 +443,23 @@ export class AgentView extends ItemView {
 					const parts = f.path.split('/');
 					for (let i = 1; i < parts.length; i++) seen.add(parts.slice(0, i).join('/'));
 				}
-				const folders = Array.from(seen).filter(p => !q || p.toLowerCase().includes(q.toLowerCase())).slice(0, 8);
-				for (const p of folders) {
-					const item = resultEl.createDiv('ai-agent-ctx-file-item');
-					item.createSpan({ text: '📁 ' + (p.split('/').pop() ?? p) });
-					item.addEventListener('click', () => {
-						void (async () => {
-							thread.folderPath = p;
-							thread.updatedAt = Date.now();
-							await this.plugin.saveAll();
-							input.value = p;
-							resultEl.empty();
-						})();
+				Array.from(seen).filter(p => !q || p.toLowerCase().includes(q.toLowerCase())).slice(0, 8)
+					.forEach(p => {
+						const item = resultEl.createDiv('ai-agent-ctx-file-item');
+						item.createSpan({ text: '📁 ' + (p.split('/').pop() ?? p) });
+						item.addEventListener('click', () => {
+							void (async () => { thread.folderPath = p; await save(); input.value = p; resultEl.empty(); })();
+						});
 					});
-				}
 			};
-
 			input.addEventListener('input', () => renderFolders(input.value));
-			input.addEventListener('blur', () => {
-				void (async () => {
-					if (input.value) {
-						thread.folderPath = input.value;
-						thread.updatedAt = Date.now();
-						await this.plugin.saveAll();
-					}
-				})();
-			});
+			input.addEventListener('blur', () => { if (input.value) { thread.folderPath = input.value; void save(); } });
 			renderFolders('');
 			setTimeout(() => input.focus(), 10);
 		};
 
-		renderModeOptions();
-		if ((thread.contextMode ?? 'active_file') === 'folder') showFolderInput();
+		renderCheckboxes();
+		if (getEffectiveModes(thread).includes('folder')) showFolderInput();
 
 		popover.createEl('hr', { cls: 'ai-agent-ctx-sep' });
 		const agentMdRow = popover.createDiv('ai-agent-popover-toggle');
@@ -428,19 +467,31 @@ export class AgentView extends ItemView {
 		agentMdCb.checked = thread.includeAgentMd !== false;
 		agentMdRow.createSpan({ text: 'agent.md' });
 		agentMdCb.addEventListener('change', () => {
-			void (async () => {
-				thread.includeAgentMd = agentMdCb.checked;
-				thread.updatedAt = Date.now();
-				await this.plugin.saveAll();
-			})();
+			void (async () => { thread.includeAgentMd = agentMdCb.checked; thread.updatedAt = Date.now(); await this.plugin.saveAll(); })();
 		});
 	}
 
 	private fillOptionsPopover(popover: HTMLElement) {
+		popover.addClass('ai-agent-tools-popover');
 		popover.createEl('p', { text: 'Tools', cls: 'ai-agent-popover-title' });
-		this.addToggle(popover, 'Websearch', this.options.webSearch, v => { this.options.webSearch = v; });
-		this.addToggle(popover, 'Thinking Mode', this.options.thinkingMode, v => { this.options.thinkingMode = v; });
-		this.addToggle(popover, 'Vault-Tools (Agent)', this.options.vaultTools, v => { this.options.vaultTools = v; });
+		this.addIconToggle(popover, 'globe', 'Websearch', 'Websuche aktivieren', this.options.webSearch, v => { this.options.webSearch = v; });
+		this.addIconToggle(popover, 'brain', 'Thinking Mode', 'Erweitertes Denken', this.options.thinkingMode, v => { this.options.thinkingMode = v; });
+		this.addIconToggle(popover, 'folder-open', 'Vault-Tools', 'Dateizugriff & Suche', this.options.vaultTools, v => { this.options.vaultTools = v; });
+	}
+
+	private addIconToggle(parent: HTMLElement, iconName: string, label: string, desc: string, checked: boolean, onChange: (v: boolean) => void) {
+		const row = parent.createDiv('ai-agent-tool-row');
+		const left = row.createDiv('ai-agent-tool-left');
+		const iconEl = left.createSpan({ cls: 'ai-agent-tool-icon' });
+		setIcon(iconEl, iconName);
+		const info = left.createDiv('ai-agent-tool-info');
+		info.createDiv({ cls: 'ai-agent-tool-label', text: label });
+		if (desc) info.createDiv({ cls: 'ai-agent-tool-desc', text: desc });
+		const toggleLabel = row.createEl('label', { cls: 'ai-agent-toggle-switch' });
+		const cb = toggleLabel.createEl('input', { attr: { type: 'checkbox' } });
+		cb.checked = checked;
+		toggleLabel.createSpan({ cls: 'ai-agent-toggle-slider' });
+		cb.addEventListener('change', () => onChange(cb.checked));
 	}
 
 	private addToggle(parent: HTMLElement, label: string, checked: boolean, onChange: (v: boolean) => void) {
@@ -462,7 +513,10 @@ export class AgentView extends ItemView {
 		const renderFiltered = (f: string) => {
 			listEl.empty();
 			const lf = f.toLowerCase();
-			const vis = getAllModels(custom).filter(m => !f || m.label.toLowerCase().includes(lf) || m.provider.toLowerCase().includes(lf) || m.id.toLowerCase().includes(lf));
+			const vis = getAllModels(custom).filter(m =>
+				!m.deprecated &&
+				(!f || m.label.toLowerCase().includes(lf) || m.provider.toLowerCase().includes(lf) || m.id.toLowerCase().includes(lf))
+			);
 			if (!vis.length) { listEl.createEl('p', { text: 'Kein Modell gefunden.', cls: 'ai-agent-model-empty' }); return; }
 			vis.forEach(m => this.addModelItem(listEl, m.id, thread));
 		};
@@ -494,8 +548,14 @@ export class AgentView extends ItemView {
 		if (model.id === thread.selectedModelId) item.addClass('is-selected');
 		const main = item.createDiv('ai-agent-model-item-main');
 		main.createSpan({ text: model.label, cls: 'ai-agent-model-item-name' });
-		main.createSpan({ text: model.provider, cls: 'ai-agent-model-item-provider' });
-		item.createSpan({ text: model.quality, cls: 'ai-agent-model-item-speed' });
+		const availability = getModelAvailability(model);
+		main.createSpan({ text: `${model.provider} · ${availability}`, cls: 'ai-agent-model-item-provider' });
+		const badges = item.createDiv('ai-agent-model-item-badges');
+		badges.createSpan({ text: model.quality, cls: 'ai-agent-model-item-speed' });
+		if (availability !== 'verified') {
+			const badge = badges.createSpan({ text: availability, cls: `ai-agent-model-item-availability is-${availability}` });
+			badge.title = getModelSourceUrl(model);
+		}
 		item.addEventListener('click', () => {
 			thread.selectedModelId = model.id;
 			this.plugin.settings.lastSelectedModelId = model.id;
@@ -508,10 +568,27 @@ export class AgentView extends ItemView {
 	// ── Agent send loop ────────────────────────────────────────
 
 	private async handleSend() {
-		const message = this.inputEl.value.trim();
-		if (!message || this.isLoading) return;
+		const rawMessage = this.inputEl.value.trim();
+		if (!rawMessage || this.isLoading) return;
 
 		const thread = this.plugin.getActiveThread();
+
+		// Slash commands route one message explicitly. Normal input stays automatic.
+		const parsedSlash = parseSlashCommand(rawMessage);
+		const slashCmd = parsedSlash.command;
+		let strippedMsg = parsedSlash.stripped;
+		if (slashCmd && !strippedMsg) {
+			if (slashCmd === 'agent' && thread.pendingTaskPlan) {
+				strippedMsg = 'mach das';
+			} else {
+			this.inputEl.value = '';
+			this.inputEl.setCssProps({ height: 'auto' });
+			this.inputEl.setAttribute('placeholder', `/${slashCmd} direkt mit Aufgabe verwenden…`);
+			return;
+			}
+		}
+		const message = slashCmd ? strippedMsg : rawMessage;
+
 		this.inputEl.value = '';
 		this.inputEl.setCssProps({ height: 'auto' });
 		this.statusBodyEl = null;
@@ -527,12 +604,14 @@ export class AgentView extends ItemView {
 
 		const modelConfig = getModelConfigWithCustom(thread.selectedModelId, this.plugin.settings.customModels);
 		if (!modelConfig) { this.appendStatusLine(`Unbekanntes Modell: ${thread.selectedModelId}`); return; }
-		const isEditRequest = this.isLikelyEditRequest(message);
+		const apiModelId = getModelApiId(modelConfig);
+		const reasoning = modelConfig.reasoning ?? (this.options.thinkingMode ? legacyThinkingReasoning(modelConfig) : undefined);
+		const thinkingMode = isReasoningActive(reasoning);
 		const llmRerankFn = this.plugin.settings.enableLlmRerank
 			? async (prompt: string) => {
 				const rerankPayload: ChatRequestPayload = {
 					provider: modelConfig.provider,
-					model: thread.selectedModelId,
+					model: apiModelId,
 					auth: this.getAuthForProvider(modelConfig.provider),
 					message: prompt,
 					history: [],
@@ -559,34 +638,94 @@ export class AgentView extends ItemView {
 		this.contextResolver.setLlmRerankFn(llmRerankFn);
 
 		// Check rate-limit cooldown from a previous request
-		const waitSecs = rateLimitManager.shouldWait(modelConfig.provider, thread.selectedModelId);
+		const waitSecs = rateLimitManager.shouldWait(modelConfig.provider, apiModelId);
 		if (waitSecs > 0) {
 			this.appendStatusLine(`Rate Limit — warte ${waitSecs}s…`);
 			await new Promise(r => setTimeout(r, waitSecs * 1000));
 		}
 
+		// ── Intent routing ─────────────────────────────────────────
+		const intentInput = {
+			hasActiveFile: Boolean(getEffectiveModes(thread).includes('active_file') && this.app.workspace.getActiveFile()?.path),
+			hasMentionedFiles: this.contextResolver.getReferencedFilePaths(message).length > 0,
+			hasSelection: Boolean(this.app.workspace.getActiveFile() && window.getSelection()?.toString().trim()),
+			webSearchEnabled: this.options.webSearch && modelConfig.supportsWebSearch,
+		};
+		let routeResult = routeIntent(rawMessage, 'ask', {
+			...intentInput,
+			learnedIntentPatterns: this.plugin.settings.learnedIntentPatterns,
+		});
+		const pendingPlan = thread.pendingTaskPlan ? clonePendingTaskPlan(thread.pendingTaskPlan) : null;
+		const revisePendingPlan = Boolean(pendingPlan && isPendingPlanRevisionRequest(message));
+		const executePendingPlan = Boolean(pendingPlan && !revisePendingPlan && isPendingPlanExecutionRequest(message));
+		if (executePendingPlan) {
+			routeResult = {
+				mode: 'agent',
+				needsPlanner: true,
+				allowWrites: true,
+				maxRetrievedChunks: 10,
+				reason: 'Gespeicherter Plan bestaetigt',
+				confidence: 'high',
+				signals: ['pending_plan_execute'],
+			};
+		} else if (revisePendingPlan) {
+			routeResult = {
+				mode: 'plan',
+				needsPlanner: true,
+				allowWrites: false,
+				maxRetrievedChunks: 10,
+				reason: 'Gespeicherten Plan anpassen',
+				confidence: 'high',
+				signals: ['pending_plan_revision'],
+			};
+		}
+		if (!executePendingPlan && !revisePendingPlan && this.plugin.settings.enableIntentClassifier && shouldRunIntentClassifier(routeResult, {
+			message,
+			...intentInput,
+		})) {
+			const classifiedRoute = await this.classifyIntentWithLlm(message, routeResult, intentInput, modelConfig.provider, apiModelId);
+			routeResult = classifiedRoute;
+		}
+
 		// Resolve & compact context to stay within provider token limits
-		const resolvedContext = await this.contextResolver.resolveContext(thread, message);
-		const rawContext = [...buildWorkingMemoryContext(thread), ...resolvedContext];
-		const profile = getRateLimitProfile(modelConfig.provider, thread.selectedModelId);
-		const learnedTpm = rateLimitManager.learnedTpm(modelConfig.provider, thread.selectedModelId);
-		const profileContextChars = defaultMaxContextChars(modelConfig.provider, thread.selectedModelId);
+		const resolvedContext = await this.contextResolver.resolveContext(thread, message, { route: routeResult });
+		const pendingPlanContext = pendingPlan && (executePendingPlan || revisePendingPlan)
+			? [buildPendingPlanContext(pendingPlan)]
+			: [];
+		const rawContext = [...pendingPlanContext, ...buildWorkingMemoryContext(thread), ...resolvedContext];
+		const profile = getRateLimitProfile(modelConfig.provider, apiModelId);
+		const learnedTpm = rateLimitManager.learnedTpm(modelConfig.provider, apiModelId);
+		const profileContextChars = defaultMaxContextChars(modelConfig.provider, apiModelId);
 		const dynamicContextChars = learnedTpm ? Math.max(8_000, Math.floor(learnedTpm * 0.35 * 3)) : profileContextChars;
 		const maxContextChars = Math.min(profileContextChars, dynamicContextChars);
-		const context = compactContextForBudget(rawContext, maxContextChars, { intent: this.contextResolver.getLastIntent(), query: message });
-		this.appendContextToUserBubble(userBubbleWrapper, context);
-		const taskComplexity = classifyTaskComplexity(message, context);
-		const usePlanner = isEditRequest || shouldUsePlanner(message, context);
+		const context = compactContextForBudget(rawContext, maxContextChars, {
+			intent: this.contextResolver.getLastIntent(),
+			query: message,
+			maxRetrievedChunks: routeResult.maxRetrievedChunks,
+		});
 
-		const history = buildCompactHistory(thread).slice(0, -1);
-		const vaultToolsEnabled = this.options.vaultTools;
-		const maxOutputTokens = defaultMaxOutputTokens(modelConfig.provider, thread.selectedModelId);
-		const templateHint = this.plugin.settings.autoApplyFileTemplates
-			? buildTemplateHint(message, context)
-			: undefined;
-		const editFormatHint = buildEditFormatHint(modelConfig.provider, thread.selectedModelId);
+		const writesBlocked = !routeResult.allowWrites;
+		const usePlanner = (() => {
+			if (executePendingPlan) return false;
+			switch (routeResult.mode) {
+				case 'ask':   return false;
+				case 'edit':  return shouldUsePlanner(message, context);
+				case 'agent': return classifyTaskComplexity(message, context) !== 'simple' || shouldUsePlanner(message, context);
+				case 'plan':  return true;
+			}
+		})();
+
+			const history = buildCompactHistory(thread).slice(0, -1);
+			const vaultToolsEnabled = this.options.vaultTools;
+			const maxOutputTokens = defaultMaxOutputTokens(modelConfig.provider, apiModelId);
+			const allowedToolNames = this.buildAllowedToolNamesForRequest(routeResult.mode, message, thread);
+			const templateHint = this.plugin.settings.autoApplyFileTemplates
+				? buildTemplateHint(message, context)
+				: undefined;
+		const editFormatHint = buildEditFormatHint(modelConfig.provider, apiModelId);
 		const baseOptions = {
-			thinking_mode: this.options.thinkingMode && modelConfig.supportsThinking,
+			thinking_mode: thinkingMode,
+			reasoning,
 			web_search: this.options.webSearch && modelConfig.supportsWebSearch,
 			vault_tools_enabled: vaultToolsEnabled,
 			stream: false,
@@ -594,7 +733,9 @@ export class AgentView extends ItemView {
 			max_output_tokens: maxOutputTokens,
 			agent_mode: this.plugin.settings.agentMode,
 			execution_phase: usePlanner ? 'plan' as const : 'normal' as const,
-			style_profile: buildStyleProfile(this.plugin.settings, maxContextChars),
+				ui_mode: routeResult.mode,
+				allowed_tool_names: allowedToolNames,
+				style_profile: buildStyleProfile(this.plugin.settings, maxContextChars),
 			template_hint: templateHint,
 			edit_format_hint: editFormatHint,
 			embedding_backend: this.plugin.settings.embeddingBackend,
@@ -602,7 +743,7 @@ export class AgentView extends ItemView {
 		};
 		const systemPrompt = buildSystemPrompt({
 			provider: modelConfig.provider,
-			model: thread.selectedModelId,
+			model: apiModelId,
 			auth: this.getAuthForProvider(modelConfig.provider),
 			message,
 			history,
@@ -652,8 +793,12 @@ export class AgentView extends ItemView {
 		this.appendStatusLine(`Embeddings: ${this.plugin.settings.embeddingBackend}`);
 		this.appendStatusLine(`Stil-Check: ${this.plugin.settings.enableStyleCritique ? 'aktiv' : 'aus'}`);
 		this.appendStatusLine(`Edit-Format: ${modelConfig.provider}`);
+		this.appendStatusLine(`Reasoning-Stufe: ${describeModelReasoning(reasoning)}`);
+		this.appendStatusLine(`Modus: ${routeResult.mode.toUpperCase()} — ${routeResult.reason}${routeResult.confidence !== 'high' ? ` (${routeResult.confidence})` : ''}`);
+		if (routeResult.signals?.length) this.appendStatusLine(`Intent-Signale: ${routeResult.signals.join(', ')}`);
+		if (writesBlocked) this.appendStatusLine(`Schreibzugriff: blockiert (${routeResult.mode}-Modus)`);
 		if (usePlanner) {
-			this.appendStatusLine(`Plan-Flow: Planphase aktiv (${taskComplexity})`);
+			this.appendStatusLine(`Plan-Flow: Planphase aktiv (${classifyTaskComplexity(message, context)})`);
 		}
 		const estTokens = estimatePayloadTokens({
 			message,
@@ -662,6 +807,19 @@ export class AgentView extends ItemView {
 			systemPrompt,
 			maxOutputTokens,
 		});
+		const debugSnapshot = buildContextDebugSnapshot({
+			rawContext,
+			finalContext: context,
+			contextModes: getEffectiveModes(thread),
+			query: message,
+			maxContextChars,
+			estimatedTokens: estTokens,
+			mode: routeResult.mode,
+			modeReason: routeResult.reason,
+			intentConfidence: routeResult.confidence,
+			intentSignals: routeResult.signals,
+		});
+		this.appendContextToUserBubble(userBubbleWrapper, context, debugSnapshot);
 		this.appendStatusLine(`~${Math.round(estTokens / 100) / 10}k Tokens geschätzt`);
 
 		if (this.plugin.settings.enableLlmRerank) {
@@ -671,20 +829,39 @@ export class AgentView extends ItemView {
 		this.setLoading(true);
 		try {
 			const toolResults: ToolResult[] = [];
-			let executionPhase: 'normal' | 'plan' | 'execute' = usePlanner ? 'plan' : 'normal';
-			let currentTaskPlan: TaskPlan | null = null;
-			let currentEditPlan: EditPlan | null = null;
-			let activeSteps: TypedStep[] = [];
+			let executionPhase: 'normal' | 'plan' | 'execute' = executePendingPlan ? 'execute' : usePlanner ? 'plan' : 'normal';
+			let currentTaskPlan: TaskPlan | null = executePendingPlan ? pendingPlan : null;
+			let currentEditPlan: EditPlan | null = executePendingPlan ? this.buildEditPlanFromTaskPlan(pendingPlan) : null;
+			let activeSteps: TypedStep[] = executePendingPlan && pendingPlan
+				? pendingPlan.steps.map(stepItem => ({ ...stepItem, status: 'pending' as const }))
+				: [];
 			let completedWithFinalResponse = false;
 			let consecutiveReadOnlyRounds = 0;
 			let latestSearchHadZeroHits = false;
 			let consecutiveBlockedReadRounds = 0;
+			const repeatedPlanErrors = new Map<string, number>();
+			const mutationReasons = new Map<string, string>();
+			const resetPhaseLoopCounters = () => {
+				consecutiveReadOnlyRounds = 0;
+				consecutiveBlockedReadRounds = 0;
+				latestSearchHadZeroHits = false;
+			};
+			if (executePendingPlan && currentTaskPlan) {
+				this.appendStatusLine('Pending-Plan: bestaetigt, Ausfuehrungsphase aktiv');
+				if (activeSteps.length) this.appendStepList(activeSteps);
+				toolResults.push({
+					id: 'pending_task_plan',
+					tool: 'task_plan',
+					ok: true,
+					result: currentTaskPlan,
+				});
+			}
 
 			for (let step = 0; step < MAX_AGENT_STEPS; step++) {
 				const compactedToolResults = compactToolResults(toolResults);
 				const payload: ChatRequestPayload = {
 					provider: modelConfig.provider,
-					model: thread.selectedModelId,
+					model: apiModelId,
 					auth: this.getAuthForProvider(modelConfig.provider),
 					message,
 					history,
@@ -701,14 +878,17 @@ export class AgentView extends ItemView {
 					rawContext,
 					maxContextChars,
 					modelConfig.provider,
-					thread.selectedModelId,
+					apiModelId,
 					{ intent: this.contextResolver.getLastIntent(), query: message },
 				);
 
 				for (const ev of response.events ?? []) this.appendProviderStatus(ev.text, step + 1);
+				const usageLine = formatProviderUsage(response.usage);
+				if (usageLine) this.appendStatusLine(`Usage: ${usageLine}`);
 
 				if (response.tool_calls?.length) {
-					const roundGuard = getRoundLoopGuard(response.tool_calls, toolResults, consecutiveReadOnlyRounds, latestSearchHadZeroHits);
+						const editReadLoopGuard = getEditReadLoopGuard(response.tool_calls, toolResults, message, routeResult.mode);
+						const roundGuard = editReadLoopGuard ?? getRoundLoopGuard(response.tool_calls, toolResults, consecutiveReadOnlyRounds, latestSearchHadZeroHits);
 					if (roundGuard) {
 						this.appendStatusLine(`Loop-Guard: ${roundGuard}`);
 						toolResults.push({
@@ -729,7 +909,10 @@ export class AgentView extends ItemView {
 							completedWithFinalResponse = true;
 							break;
 						}
-						if (executionPhase === 'execute') executionPhase = 'plan';
+						if (executionPhase === 'execute') {
+							executionPhase = 'plan';
+							resetPhaseLoopCounters();
+						}
 						continue;
 					}
 					let completedToolCalls = 0;
@@ -742,23 +925,58 @@ export class AgentView extends ItemView {
 					let blockedReadThisRound = false;
 					const currentRoundReadPaths = new Set<string>();
 					for (const call of response.tool_calls) {
+						if (baseOptions.allowed_tool_names && !baseOptions.allowed_tool_names.includes(call.tool)) {
+							this.appendStatusLine(`Tool-Guard: ${call.tool} nicht im erlaubten Toolset`);
+							toolResults.push({
+								id: call.id,
+								tool: call.tool,
+								args: call.args,
+								provider_context: call.provider_context,
+								ok: false,
+								error: `Tool guard: ${call.tool} is not allowed for this request. Allowed tools: ${baseOptions.allowed_tool_names.join(', ')}.`,
+							});
+							continue;
+						}
 						if (executionPhase === 'plan' && !PLAN_ALLOWED_TOOLS.has(call.tool)) {
 							this.appendStatusLine(`Plan-Guard: ${call.tool} in Planphase blockiert`);
 							toolResults.push({
-								id: `${call.id}_plan_guard`,
+								id: call.id,
 								tool: call.tool,
+								args: call.args,
+								provider_context: call.provider_context,
 								ok: false,
 								error: `Planning phase: ${call.tool} is not allowed yet. Read/search first and return a short edit plan before executing write tools.`,
 							});
 							continue;
 						}
-						this.appendStatusLine(`Tool: ${call.tool}${call.reason ? ` — ${call.reason}` : ''}`);
-						const duplicateReadError = getDuplicateReadGuard(call, toolResults, currentRoundReadPaths);
+						if (writesBlocked && WRITE_TOOLS.has(call.tool)) {
+							this.appendStatusLine(`Modus-Guard: ${call.tool} blockiert (${routeResult.mode}-Modus erlaubt keine Schreibzugriffe)`);
+							toolResults.push({ id: call.id, tool: call.tool, args: call.args, provider_context: call.provider_context, ok: false, error: `Mode guard: write tools blocked in ${routeResult.mode} mode. Switch to /edit or /agent mode to make changes.` });
+							continue;
+							}
+							this.appendStatusLine(`Tool: ${call.tool}${call.reason ? ` — ${call.reason}` : ''}`);
+							const readFolderScopeError = this.validateReadToolScope(call, thread, message, routeResult.mode);
+							if (readFolderScopeError) {
+								this.appendStatusLine(`Scope-Guard: ${readFolderScopeError}`);
+								toolResults.push({
+									id: call.id,
+									tool: call.tool,
+									args: call.args,
+									provider_context: call.provider_context,
+									ok: false,
+									error: readFolderScopeError,
+								});
+								blockedReadThisRound = true;
+								continue;
+							}
+							const duplicateReadError = getDuplicateReadGuard(call, toolResults, currentRoundReadPaths);
 						if (duplicateReadError) {
 							this.appendStatusLine(`Loop-Guard: ${duplicateReadError}`);
 							toolResults.push({
-								id: `${call.id}_duplicate_read`,
+								id: call.id,
 								tool: call.tool,
+								args: call.args,
+								provider_context: call.provider_context,
 								ok: false,
 								error: duplicateReadError,
 							});
@@ -774,13 +992,28 @@ export class AgentView extends ItemView {
 							if (guardError) {
 								this.appendStatusLine(`Execute-Guard: ${guardError}`);
 								toolResults.push({
-									id: `${call.id}_execute_guard`,
+									id: call.id,
 									tool: call.tool,
+									args: call.args,
+									provider_context: call.provider_context,
 									ok: false,
 									error: guardError,
 								});
 								continue;
 							}
+						}
+						const writeSafetyError = this.validateWriteSafety(call, toolResults, message);
+						if (writeSafetyError) {
+							this.appendStatusLine(`Write-Guard: ${writeSafetyError}`);
+							toolResults.push({
+								id: call.id,
+								tool: call.tool,
+								args: call.args,
+								provider_context: call.provider_context,
+								ok: false,
+								error: writeSafetyError,
+							});
+							continue;
 						}
 						const result = await this.toolExecutor.execute(call);
 						toolResults.push(result);
@@ -808,9 +1041,14 @@ export class AgentView extends ItemView {
 						if (result.ok) completedToolCalls += 1;
 						if (WRITE_TOOLS.has(call.tool) && result.ok) {
 							roundHadWrite = true;
+							const mutationPath = resultPath ?? (typeof call.args['path'] === 'string' ? call.args['path'] : '');
+							const mutationReason = typeof call.reason === 'string' ? call.reason.trim() : '';
+							if (mutationPath && mutationReason) mutationReasons.set(mutationPath, mutationReason);
 						}
 						if (call.tool === 'search_vault' && result.ok && getSearchResultCount(result) === 0) roundSearchZeroHits = true;
-						if (!result.ok && result.error) this.appendStatusLine(`Tool-Fehler: ${result.error}`);
+						if (!result.ok && result.error) {
+							this.appendStatusLine(result.cancelled ? `Tool abgelehnt: ${result.error}` : `Tool-Fehler: ${result.error}`);
+						}
 
 						if (currentTaskPlan && activeSteps.length > 0) {
 							const advanced = advanceTaskPlan(currentTaskPlan, call.tool, result.ok, result.error);
@@ -876,7 +1114,22 @@ export class AgentView extends ItemView {
 							ok: false,
 							error: 'Too many read-only rounds. You must now either: (1) call read_file on the specific target file you identified, then immediately patch_file or write_file it; or (2) return a concise status answer. Do NOT call search_vault or list_files again.',
 						});
-						if (executionPhase === 'execute') executionPhase = 'plan';
+						if (executionPhase === 'execute') {
+							executionPhase = 'plan';
+							resetPhaseLoopCounters();
+						}
+					}
+					if (roundHadWrite && !this.hasPendingMutationStep(currentTaskPlan)) {
+						const finalAnswer = postCheckAssistantAnswer(
+							this.buildSuccessfulMutationMessage(toolResults, currentTaskPlan, mutationReasons, message),
+							this.plugin.settings,
+							{ mutatedPaths: this.getMutatedPaths(toolResults) },
+						);
+						await this.maybePersistUserPreference(message, toolResults);
+						if (executePendingPlan) this.clearPendingTaskPlan(thread);
+						await this.deliverAssistantMessage(thread.id, thread.selectedModelId, modelConfig.provider, finalAnswer, this.collectUsedPaths(context, toolResults), context);
+						completedWithFinalResponse = true;
+						break;
 					}
 					this.appendStatusLine(`Fortschritt: ${completedToolCalls}/${response.tool_calls.length} Tool-Aufrufe abgeschlossen, naechste Modellrunde startet`);
 					continue;
@@ -890,12 +1143,25 @@ export class AgentView extends ItemView {
 							const planError = this.validateTaskPlanAgainstContext(taskPlan, context, toolResults, message);
 							if (planError) {
 								this.appendStatusLine(`Plan-Fehler: ${planError}`);
+								const planErrorCount = (repeatedPlanErrors.get(planError) ?? 0) + 1;
+								repeatedPlanErrors.set(planError, planErrorCount);
 								toolResults.push({
 									id: `task_plan_invalid_${step + 1}`,
 									tool: 'task_plan',
 									ok: false,
-									error: planError,
+									error: this.buildPlanRepairHint(planError, context, toolResults),
 								});
+								if (planErrorCount >= 2) {
+									const fallbackAnswer = this.buildFallbackAssistantMessage(
+										message,
+										toolResults,
+										currentTaskPlan,
+										`Der Plan wurde wiederholt mit demselben ungueltigen Ziel abgelehnt: ${planError}`,
+									);
+									await this.deliverAssistantMessage(thread.id, thread.selectedModelId, modelConfig.provider, fallbackAnswer, this.collectUsedPaths(context, toolResults), context);
+									completedWithFinalResponse = true;
+									break;
+								}
 								continue;
 							}
 							currentTaskPlan = taskPlan;
@@ -912,11 +1178,28 @@ export class AgentView extends ItemView {
 								ok: true,
 								result: taskPlan,
 							});
+							// Plan mode: deliver plan as answer, no execution
+							if (routeResult.mode === 'plan') {
+								this.savePendingTaskPlan(thread, taskPlan);
+								this.appendStatusLine('Pending-Plan: gespeichert, wartet auf Bestaetigung');
+								const planDisplay = this.formatPlanForDisplay(taskPlan);
+								await this.deliverAssistantMessage(thread.id, thread.selectedModelId, modelConfig.provider, planDisplay, [], context);
+								completedWithFinalResponse = true;
+								break;
+							}
 							executionPhase = 'execute';
+							resetPhaseLoopCounters();
 							this.appendStatusLine('Plan-Flow: Ausfuehrungsphase aktiv');
 							continue;
 						}
 						const fallbackPlan = buildFallbackPlan(message, context);
+						if (routeResult.mode === 'plan') {
+							this.appendStatusLine('Plan-Hinweis: unstrukturierter Plantext wird direkt ausgegeben');
+							const planDisplay = this.formatUnstructuredPlanForDisplay(response.answer);
+							await this.deliverAssistantMessage(thread.id, thread.selectedModelId, modelConfig.provider, planDisplay, [], context);
+							completedWithFinalResponse = true;
+							break;
+						}
 						this.appendStatusLine('Plan-Fehler: strukturierter Plan fehlt oder ist ungueltig');
 						toolResults.push({
 							id: `task_plan_invalid_${step + 1}`,
@@ -938,16 +1221,24 @@ export class AgentView extends ItemView {
 							error: `Replan required: ${replan.reason ?? 'one or more execution steps failed'}`,
 						});
 						executionPhase = 'plan';
+						resetPhaseLoopCounters();
 						continue;
 					}
-					const mutatedPaths = toolResults
-						.filter(result => result.ok && ['write_file', 'patch_file', 'delete_file'].includes(result.tool))
-						.map(result => {
-							if (!result.result || typeof result.result !== 'object') return '';
-							return ((result.result as { path?: unknown }).path as string | undefined) ?? '';
-						})
-						.filter(Boolean)
-						.filter((path, index, list) => list.indexOf(path) === index);
+					if (executionPhase === 'execute' && currentTaskPlan) {
+						const redundantPlan = parseTaskPlan(response.answer)
+							?? this.buildTaskPlanFromLegacyEditPlan(parseStructuredEditPlan(response.answer));
+						if (redundantPlan) {
+							this.appendStatusLine('Execute-Guard: Modell hat erneut einen Plan geliefert; Ausfuehrung wird angefordert');
+							toolResults.push({
+								id: `execute_plan_instead_of_tools_${step + 1}`,
+								tool: 'task_plan',
+								ok: false,
+								error: 'A valid task plan is already accepted and execution phase is active. Do not return another plan or JSON. Execute the pending write/patch steps now using the available tools.',
+							});
+							continue;
+						}
+					}
+					const mutatedPaths = this.getMutatedPaths(toolResults);
 					const finalAnswer = postCheckAssistantAnswer(response.answer, this.plugin.settings, { mutatedPaths });
 					await this.maybePersistUserPreference(message, toolResults);
 					const usedPaths = [
@@ -993,6 +1284,108 @@ export class AgentView extends ItemView {
 		].filter((p, i, a) => a.indexOf(p) === i);
 	}
 
+	private getMutatedPaths(toolResults: ToolResult[]): string[] {
+		return toolResults
+			.filter(result => result.ok && ['write_file', 'patch_file', 'delete_file'].includes(result.tool))
+			.map(result => {
+				if (!result.result || typeof result.result !== 'object') return '';
+				return ((result.result as { path?: unknown }).path as string | undefined) ?? '';
+			})
+			.filter((path): path is string => Boolean(path))
+			.filter((path, index, list) => list.indexOf(path) === index);
+	}
+
+	private hasPendingMutationStep(plan: TaskPlan | null): boolean {
+		return Boolean(plan?.steps.some(step =>
+			step.status === 'pending' && ['write', 'patch', 'delete'].includes(step.type),
+		));
+	}
+
+	private savePendingTaskPlan(thread: ChatThread, plan: TaskPlan) {
+		thread.pendingTaskPlan = clonePendingTaskPlan(plan);
+		thread.pendingTaskPlanCreatedAt = Date.now();
+		thread.updatedAt = Date.now();
+		void this.plugin.saveAll();
+	}
+
+	private clearPendingTaskPlan(thread: ChatThread) {
+		if (!thread.pendingTaskPlan) return;
+		delete thread.pendingTaskPlan;
+		delete thread.pendingTaskPlanCreatedAt;
+		thread.updatedAt = Date.now();
+		void this.plugin.saveAll();
+	}
+
+	private buildSuccessfulMutationMessage(
+		toolResults: ToolResult[],
+		taskPlan: TaskPlan | null = null,
+		mutationReasons: Map<string, string> = new Map(),
+		userMessage = '',
+	): string {
+		const paths = this.getMutatedPaths(toolResults);
+		const changed = paths.length
+			? paths.map(path => {
+				const result = toolResults.find(item => {
+					if (!item.ok || !item.result || typeof item.result !== 'object') return false;
+					return ((item.result as { path?: unknown }).path as string | undefined) === path;
+				});
+				const action = result?.result && typeof result.result === 'object'
+					? ((result.result as { action?: unknown }).action as string | undefined)
+					: undefined;
+				const reason = this.formatMutationReason(mutationReasons.get(path));
+				return `- ${path}: ${reason ?? this.describeMutationAction(action)}.`;
+			}).join('\n')
+			: '- Datei aktualisiert';
+		const completedSteps = taskPlan?.steps
+			.filter(step => step.status === 'done' && ['write', 'patch', 'delete'].includes(step.type))
+			.slice(0, 3)
+			.map(step => `- ${step.description}${step.target ? ` (${step.target})` : ''}`)
+			.join('\n');
+		const reasonSummary = this.buildMutationReasonSummary(paths, mutationReasons, userMessage);
+		const summary = reasonSummary
+			? `Kurzfassung: ${reasonSummary}`
+			: taskPlan?.operation?.trim()
+				? `Kurzfassung: ${taskPlan.operation.trim()}`
+				: completedSteps ? `Kurzfassung:\n${completedSteps}` : '';
+		return [
+			'Erledigt. Die Änderung wurde geschrieben.',
+			summary,
+			`Geändert:\n${changed}`,
+		].filter(Boolean).join('\n\n');
+	}
+
+	private buildMutationReasonSummary(paths: string[], mutationReasons: Map<string, string>, userMessage: string): string | null {
+		const reasons = paths
+			.map(path => this.formatMutationReason(mutationReasons.get(path)))
+			.filter((reason): reason is string => Boolean(reason));
+		if (reasons.length > 0) return Array.from(new Set(reasons)).slice(0, 2).join(' ');
+		const fallback = this.formatMutationReason(userMessage);
+		return fallback && fallback.length <= 220 ? fallback : null;
+	}
+
+	private formatMutationReason(reason: string | undefined): string | null {
+		const cleaned = reason
+			?.replace(/\s+/g, ' ')
+			.replace(/^die\s+/i, '')
+			.replace(/^der\s+/i, '')
+			.replace(/^das\s+/i, '')
+			.replace(/\bsoll\s+/i, '')
+			.trim();
+		if (!cleaned) return null;
+		const normalized = cleaned.charAt(0).toUpperCase() + cleaned.slice(1);
+		return normalized.endsWith('.') ? normalized.slice(0, -1) : normalized;
+	}
+
+	private describeMutationAction(action: string | undefined): string {
+		switch (action) {
+			case 'created': return 'neu erstellt';
+			case 'modified': return 'vollständig überschrieben';
+			case 'patched': return 'gezielt bearbeitet';
+			case 'trashed': return 'gelöscht';
+			default: return 'aktualisiert';
+		}
+	}
+
 	private async deliverAssistantMessage(
 		threadId: string,
 		modelId: string,
@@ -1017,13 +1410,26 @@ export class AgentView extends ItemView {
 		reason: string,
 	): string {
 		const readPaths = getReadPaths(toolResults);
+		const readFolderPaths = toolResults
+			.filter(result => result.ok && result.tool === 'read_folder')
+			.map(result => {
+				if (!result.result || typeof result.result !== 'object') return '';
+				return ((result.result as { path?: unknown }).path as string | undefined) ?? '';
+			})
+			.filter(Boolean);
+		const searchCount = toolResults.filter(result => result.ok && result.tool === 'search_vault').length;
 		const changedPaths = toolResults
 			.filter(result => result.ok && ['write_file', 'patch_file', 'delete_file'].includes(result.tool))
 			.map(result => ((result.result as { path?: string } | undefined)?.path) ?? '')
 			.filter(Boolean);
 		const failedTools = toolResults.filter(result => !result.ok);
 		const uniqueChanged = changedPaths.filter((path, index, list) => list.indexOf(path) === index);
-		const topRead = Array.from(readPaths).slice(0, 6).map(path => `- ${path}`).join('\n');
+		const topRead = [
+			...Array.from(readPaths).map(path => `- Datei: ${path}`),
+			...readFolderPaths.map(path => `- Ordner: ${path}`),
+			searchCount > 0 ? `- Vault-Suchen: ${searchCount}` : '',
+		].filter(Boolean).slice(0, 8).join('\n');
+		const hadSuccessfulDiscovery = Boolean(topRead);
 		const nextPlanned = taskPlan?.steps
 			?.filter(step => step.status === 'pending')
 			.slice(0, 3)
@@ -1036,7 +1442,7 @@ export class AgentView extends ItemView {
 			'',
 			shortReason ? `Zwischenstand: ${shortReason}` : '',
 			'',
-			readPaths.size
+			hadSuccessfulDiscovery
 				? `Bereits geprueft:\n${topRead}`
 				: 'Es wurden noch keine relevanten Dateien erfolgreich eingelesen.',
 			uniqueChanged.length
@@ -1106,7 +1512,82 @@ export class AgentView extends ItemView {
 		if (writeResult.ok) this.appendStatusLine('Praeferenz gespeichert: user_preferences.md');
 	}
 
-	// Sends a request and automatically retries once with smaller context on 429 / ctx errors
+	private async classifyIntentWithLlm(
+		message: string,
+		baseRoute: RouterResult,
+		intentInput: {
+			hasActiveFile?: boolean;
+			hasMentionedFiles?: boolean;
+			hasSelection?: boolean;
+			webSearchEnabled?: boolean;
+		},
+		provider: ProviderName,
+		model: string,
+	): Promise<RouterResult> {
+		const prompt = buildIntentClassifierPrompt({
+			message,
+			...intentInput,
+			baseMode: baseRoute.mode,
+			baseConfidence: baseRoute.confidence,
+			baseSignals: baseRoute.signals,
+		});
+		try {
+			const response = await callProvider({
+				provider,
+				model,
+				auth: this.getAuthForProvider(provider),
+				message: prompt,
+				history: [],
+				context: [],
+				tool_results: [],
+				options: {
+					thinking_mode: false,
+					web_search: false,
+					vault_tools_enabled: false,
+					stream: false,
+					max_context_chars: 1200,
+					max_output_tokens: 180,
+					agent_mode: 'read',
+					execution_phase: 'normal',
+					embedding_backend: this.plugin.settings.embeddingBackend,
+					enable_style_critique: false,
+				},
+			});
+			const parsed = parseIntentClassifierResult(response.answer ?? '');
+			if (!parsed) {
+				return {
+					...baseRoute,
+					reason: `${baseRoute.reason}; KI-Classifier nicht parsebar`,
+					signals: [...(baseRoute.signals ?? []), 'classifier_parse_failed'],
+				};
+			}
+			this.plugin.settings.learnedIntentPatterns = learnIntentPattern(
+				this.plugin.settings.learnedIntentPatterns,
+				message,
+				parsed.mode,
+				parsed.confidence,
+			);
+			await this.plugin.saveSettings();
+			const nextRoute = applyClassifierResult(baseRoute, parsed, { message, ...intentInput });
+			if (nextRoute === baseRoute) {
+				return {
+					...baseRoute,
+					reason: `${baseRoute.reason}; KI-Classifier blieb bei Sicherheitsfallback`,
+					signals: [...(baseRoute.signals ?? []), 'classifier_rejected'],
+				};
+			}
+			return nextRoute;
+		} catch {
+			return {
+				...baseRoute,
+				reason: `${baseRoute.reason}; KI-Classifier fehlgeschlagen`,
+				signals: [...(baseRoute.signals ?? []), 'classifier_error'],
+			};
+		}
+	}
+
+	// Sends a request and automatically retries once. Rate limits keep the same
+	// payload; only real context errors trigger context compaction.
 	private async callWithFallback(
 		payload: import('../agent/types').ChatRequestPayload,
 		rawContext: import('../agent/types').ContextItem[],
@@ -1126,13 +1607,18 @@ export class AgentView extends ItemView {
 
 			const info = rateLimitManager.updateFromError(provider, model, err.message);
 
-			if (is429 && info.retryAfterSeconds > 0) {
-				this.appendStatusLine(`Rate Limit — warte ${info.retryAfterSeconds}s, reduziere Kontext…`);
-				await new Promise(r => setTimeout(r, info.retryAfterSeconds * 1000));
-			} else {
-				this.appendStatusLine('Kontext zu groß — reduziere automatisch…');
+			if (is429) {
+				const waitSeconds = Math.max(0, info.retryAfterSeconds);
+				if (waitSeconds > 0) {
+					this.appendStatusLine(`Rate Limit — warte ${waitSeconds}s und versuche erneut…`);
+					await new Promise(r => setTimeout(r, waitSeconds * 1000));
+				} else {
+					this.appendStatusLine('Rate Limit — versuche erneut ohne Kontextreduktion…');
+				}
+				return await callProvider(payload);
 			}
 
+			this.appendStatusLine('Kontext zu groß — reduziere automatisch…');
 			const halvedChars = Math.max(8_000, Math.floor(maxContextChars / 2));
 			const smallerContext = compactContextForBudget(rawContext, halvedChars, budgetOptions);
 			const retryPayload: ChatRequestPayload = {
@@ -1158,9 +1644,51 @@ export class AgentView extends ItemView {
 		if (!v) this.finishStatusDisplay();
 	}
 
-	private isLikelyEditRequest(message: string): boolean {
-		const text = message.toLowerCase();
-		return /\b(aendere|ändere|bearbeite|ueberarbeite|überarbeite|schreibe|ergaenze|ergänze|aktualisiere|loesche|lösche|ersetze|strukturiere|formuliere um|rewrite|patch)\b/u.test(text);
+	private modeInputPlaceholder(mode: UIMode): string {
+		const map: Record<UIMode, string> = {
+			ask:   'Frage oder Aufgabe beschreiben…',
+			edit:  'Was soll geändert werden? (Enter = Senden)',
+			agent: 'Aufgabe beschreiben… (Enter = Senden)',
+			plan:  'Was soll geplant werden? (Enter = Senden)',
+		};
+		return map[mode];
+	}
+
+	private buildAllowedToolNamesForRequest(mode: UIMode, userMessage: string, thread: ChatThread): string[] | undefined {
+		if (mode !== 'edit') return undefined;
+		const broadDiscovery = hasExplicitBroadDiscoveryIntent(userMessage);
+		const selectedFolder = Boolean(thread.folderPath && getEffectiveModes(thread).includes('folder'));
+		const names = new Set([
+			'read_active_file',
+			'read_file',
+			'patch_file',
+			'write_file',
+			'ask_user',
+			'read_user_preferences',
+			'update_user_preferences',
+			'create_agent_md',
+		]);
+		if (broadDiscovery) {
+			names.add('search_vault');
+			names.add('list_files');
+			names.add('expand_chunk');
+		}
+		if (broadDiscovery || selectedFolder) {
+			names.add('read_folder');
+		}
+		return Array.from(names);
+	}
+
+	private validateReadToolScope(
+		call: { tool: string; args: Record<string, unknown> },
+		thread: ChatThread,
+		userMessage: string,
+		mode: UIMode,
+	): string | null {
+		if (call.tool !== 'read_folder') return null;
+		const path = typeof call.args['path'] === 'string' ? call.args['path'] : '';
+		const selectedFolder = getEffectiveModes(thread).includes('folder') ? thread.folderPath : undefined;
+		return validateReadFolderScope({ path, folderPath: selectedFolder, userMessage, mode });
 	}
 
 	private validateEditToolCall(
@@ -1186,7 +1714,11 @@ export class AgentView extends ItemView {
 		}
 
 		if (call.tool !== plan.preferred_tool) {
-			if (!(plan.safety === 'high' && plan.preferred_tool === 'patch_file' && call.tool === 'write_file')) {
+			const allowWriteFallback =
+				plan.preferred_tool === 'patch_file' &&
+				call.tool === 'write_file' &&
+				this.canFallbackFromPatchToWrite(plan, targetPath, toolResults);
+			if (!allowWriteFallback) {
 				return `${call.tool} does not match preferred_tool=${plan.preferred_tool}.`;
 			}
 		}
@@ -1206,15 +1738,63 @@ export class AgentView extends ItemView {
 		return null;
 	}
 
+	private validateWriteSafety(
+		call: { tool: string; args: Record<string, unknown> },
+		toolResults: ToolResult[],
+		userMessage: string,
+	): string | null {
+		if (call.tool !== 'write_file') return null;
+		if (call.args['overwrite'] !== true) return null;
+
+		const targetPath = typeof call.args['path'] === 'string' ? call.args['path'] : '';
+		const nextContent = typeof call.args['content'] === 'string' ? call.args['content'] : '';
+		if (!targetPath || !nextContent) return null;
+
+		const existing = this.app.vault.getAbstractFileByPath(targetPath);
+		if (!(existing instanceof TFile)) return null;
+
+		return validateOverwriteContentSafety({
+			path: targetPath,
+			nextContent,
+			previousContent: getLatestReadContentForPath(toolResults, targetPath),
+			userMessage,
+		});
+	}
+
+	private canFallbackFromPatchToWrite(plan: EditPlan, targetPath: string, toolResults: ToolResult[]): boolean {
+		const operation = plan.operation.toLowerCase();
+		const broadRewrite = /\b(komplett|vollstaendig|vollständig|rewrite|neu schreiben|umschreiben|restructure|restrukturieren|neuaufbau|neufassung|dateiweit|überall|ueberall)\b/u.test(operation);
+		const patchAlreadyFailed = toolResults.some(result =>
+			result.tool === 'patch_file' &&
+			!result.ok &&
+			typeof result.error === 'string' &&
+			(
+				result.error.includes('oldText not found') ||
+				result.error.includes('Suchtext nicht gefunden') ||
+				result.error.includes('ambiguous match')
+			),
+		);
+		const hasFreshRead = hasFreshReadForPath(toolResults, targetPath);
+		return hasFreshRead && (broadRewrite || patchAlreadyFailed || plan.safety === 'high');
+	}
+
 	private validateEditPlanAgainstContext(
 		plan: EditPlan,
 		context: ContextItem[],
 		toolResults: ToolResult[],
 		userMessage: string,
 	): string | null {
+		const newFileTargets = new Set<string>();
 		for (const path of plan.target_files) {
 			const abstractFile = this.app.vault.getAbstractFileByPath(path);
 			if (!(abstractFile instanceof TFile)) {
+				const canCreateNewFile =
+					plan.preferred_tool === 'write_file' &&
+					isLikelyNewFileCreationIntent(userMessage, plan.operation);
+				if (canCreateNewFile) {
+					newFileTargets.add(path);
+					continue;
+				}
 				return `Planned target file does not exist: ${path}.`;
 			}
 		}
@@ -1233,6 +1813,7 @@ export class AgentView extends ItemView {
 		const readPaths = getReadPaths(toolResults);
 
 		for (const path of plan.target_files) {
+			if (newFileTargets.has(path)) continue;
 			if (!focusedPaths.has(path) && !referencedPaths.has(path) && !readPaths.has(path)) {
 				return `Planned target file ${path} is not active, manually selected, explicitly referenced, or freshly read in the planning phase.`;
 			}
@@ -1265,6 +1846,32 @@ export class AgentView extends ItemView {
 		return null;
 	}
 
+	private buildPlanRepairHint(planError: string, context: ContextItem[], toolResults: ToolResult[]): string {
+		const focusedPaths = context
+			.filter(item => item.path && ['active_file', 'manual_file', 'input_reference'].includes(item.type))
+			.map(item => item.path!)
+			.filter((path, index, list) => list.indexOf(path) === index);
+		const readFiles = Array.from(getReadPaths(toolResults));
+		const readFolders = toolResults
+			.filter(result => result.ok && result.tool === 'read_folder')
+			.map(result => {
+				const value = result.result && typeof result.result === 'object'
+					? ((result.result as { path?: unknown }).path as string | undefined)
+					: undefined;
+				return value ?? '';
+			})
+			.filter(Boolean);
+		const knownTargets = [...focusedPaths, ...readFiles].filter((path, index, list) => list.indexOf(path) === index);
+		const parts = [
+			planError,
+			'Repair the plan instead of repeating it.',
+			knownTargets.length ? `Use one of these known file targets unless the user explicitly asked to create a new file: ${knownTargets.slice(0, 8).join(', ')}.` : '',
+			readFolders.length ? `Already inspected folders: ${readFolders.slice(0, 4).join(', ')}.` : '',
+			'If the intended target does not exist, ask the user or choose an existing active/read file. Do not invent README paths.',
+		];
+		return parts.filter(Boolean).join(' ');
+	}
+
 	private buildEditPlanFromTaskPlan(plan: TaskPlan | null): EditPlan | null {
 		if (!plan?.target_files?.length || !plan.preferred_tool || !plan.operation || !plan.safety) {
 			return null;
@@ -1294,6 +1901,31 @@ export class AgentView extends ItemView {
 			reasoning: plan.reasoning,
 			risk_notes: plan.risk_notes,
 		};
+	}
+
+	private formatPlanForDisplay(plan: TaskPlan): string {
+		const lines: string[] = [
+			`## Plan: ${plan.goal}`,
+			'',
+			`**Komplexität:** ${plan.complexity}`,
+		];
+		if (plan.operation) lines.push(`**Operation:** ${plan.operation}`);
+		if (plan.target_files?.length) lines.push(`**Zieldateien:** ${plan.target_files.map(f => `\`${f}\``).join(', ')}`);
+		if (plan.safety) lines.push(`**Risiko:** ${plan.safety}`);
+		lines.push('', '### Schritte', '');
+		plan.steps.forEach((s, i) => {
+			lines.push(`${i + 1}. **${s.type}**: ${s.description}${s.target ? ` → \`${s.target}\`` : ''}`);
+		});
+		lines.push('', '_Sag „ja, umsetzen“ oder „mach das“, um diesen Plan auszuführen. Für Änderungen schreibe z.B. „ändere Schritt 2 …“._');
+		return lines.join('\n');
+	}
+
+	private formatUnstructuredPlanForDisplay(answer: string): string {
+		const trimmed = answer.trim();
+		const body = /^#{1,3}\s+/m.test(trimmed)
+			? trimmed
+			: `## Plan\n\n${trimmed}`;
+		return `${body}\n\n_Dieser Plan ist nur als Text angekommen. Sag „mach daraus einen ausführbaren Plan“, wenn ich ihn als gespeicherten Plan vorbereiten soll._`;
 	}
 
 	private summarizeTaskPlan(plan: TaskPlan): string {
@@ -1347,9 +1979,9 @@ export class AgentView extends ItemView {
 	private getAuthForProvider(provider: ProviderName) {
 		const s = this.plugin.settings;
 		switch (provider) {
-			case 'openai':    return { api_key: s.openaiApiKey || null };
-			case 'anthropic': return { api_key: s.anthropicApiKey || null };
-			case 'gemini':    return { api_key: s.geminiApiKey || null };
+			case 'openai':    return { api_key: this.plugin.getProviderApiKey('openai') || null };
+			case 'anthropic': return { api_key: this.plugin.getProviderApiKey('anthropic') || null };
+			case 'gemini':    return { api_key: this.plugin.getProviderApiKey('gemini') || null };
 			case 'ollama':    return { base_url: s.ollamaBaseUrl || null };
 		}
 	}
@@ -1363,7 +1995,7 @@ export class AgentView extends ItemView {
 		return wrapper;
 	}
 
-	private appendContextToUserBubble(_wrapper: HTMLElement, contextItems: ContextItem[]) {
+	private appendContextToUserBubble(_wrapper: HTMLElement, contextItems: ContextItem[], debug?: ContextDebugSnapshot) {
 		if (!contextItems.length) return;
 		this.ensureStatusContainer();
 		if (!this.statusHeaderEl) return;
@@ -1373,6 +2005,7 @@ export class AgentView extends ItemView {
 			this.togglePopover(infoBtn, p => {
 				p.addClass('ai-user-ctx-popover');
 				p.createEl('p', { text: 'Kontext dieser Anfrage', cls: 'ai-agent-popover-title' });
+				if (debug) this.renderContextDebugInspector(p, debug);
 				for (const item of contextItems) {
 					const row = p.createDiv('ai-ctx-item');
 					const primaryPath = item.path ?? item.files?.[0]?.path ?? '';
@@ -1400,6 +2033,49 @@ export class AgentView extends ItemView {
 				}
 			});
 		});
+	}
+
+	private renderContextDebugInspector(container: HTMLElement, debug: ContextDebugSnapshot) {
+		const summary = container.createDiv('ai-ctx-debug-summary');
+		const summaryItems = [
+			`Modus: ${debug.mode.toUpperCase()} (${debug.intentConfidence})`,
+			`Kontext: ${debug.contextModes.join(' + ')}`,
+			`Items: ${debug.summary.finalItems}/${debug.summary.rawItems}`,
+			`Chars: ${debug.summary.finalChars}/${debug.summary.rawChars}`,
+			`Budget: ${debug.maxContextChars}`,
+			`~${Math.round(debug.estimatedTokens / 100) / 10}k Tokens`,
+		];
+		for (const item of summaryItems) summary.createSpan({ text: item });
+		summary.createDiv({ cls: 'ai-ctx-debug-reason', text: debug.modeReason });
+		if (debug.intentSignals.length) {
+			const signals = summary.createDiv('ai-ctx-debug-signals');
+			for (const signal of debug.intentSignals.slice(0, 8)) {
+				signals.createSpan({ text: signal });
+			}
+		}
+
+		const list = container.createDiv('ai-ctx-debug-list');
+		for (const item of debug.items) {
+			const row = list.createDiv(`ai-ctx-debug-item ${item.included ? 'is-included' : 'is-dropped'}`);
+			const head = row.createDiv('ai-ctx-debug-head');
+			head.createSpan({ cls: 'ai-ctx-debug-mode', text: item.mode });
+			head.createSpan({
+				cls: 'ai-ctx-debug-name',
+				text: item.path ?? item.label,
+				attr: { title: item.path ?? item.label },
+			});
+			head.createSpan({ cls: 'ai-ctx-debug-size', text: `${item.rawChars} -> ${item.finalChars}` });
+			row.createDiv({ cls: 'ai-ctx-debug-detail', text: item.reason });
+			const chips = row.createDiv('ai-ctx-debug-chips');
+			chips.createSpan({ text: item.type.replace(/_/g, ' ') });
+			if (item.files) chips.createSpan({ text: `${item.files} files` });
+			for (const reason of item.reasons.slice(0, 5)) chips.createSpan({ text: reason });
+			for (const [key, value] of Object.entries(item.stats)) {
+				if (value === undefined) continue;
+				if (!/confidence|score|gate|short_reference|retrieval/i.test(key)) continue;
+				chips.createSpan({ text: `${key}: ${String(value)}` });
+			}
+		}
 	}
 
 	private ensureStatusContainer() {

@@ -18,15 +18,16 @@ const TYPE_BUDGET: Partial<Record<string, ContextBudgetProfile>> = {
 	agent_md: { hardCap: 2400, softCap: 4000, elasticity: 0.4, degradeMode: 'trimmed' },
 	working_memory: { hardCap: 1800, softCap: 3000, elasticity: 0.5, degradeMode: 'trimmed' },
 	working_memory_structured: { hardCap: 1400, softCap: 2200, elasticity: 0.4, degradeMode: 'trimmed' },
+	pending_task_plan: { hardCap: 3000, softCap: 5000, elasticity: 0.8, degradeMode: 'trimmed' },
 	user_preferences: { hardCap: 1000, softCap: 1800, elasticity: 0.35, degradeMode: 'trimmed' },
 	selected_text: { hardCap: 6000, softCap: 20000, elasticity: 1, degradeMode: 'trimmed' },
-	input_reference: { hardCap: 4000, softCap: 15000, elasticity: 0.9, degradeMode: 'outline' },
+	input_reference: { hardCap: 16000, softCap: 24000, elasticity: 1, degradeMode: 'focused' },
 	retrieved_chunk: { hardCap: 3500, softCap: 12000, elasticity: 0.8, degradeMode: 'trimmed' },
 	frontmatter_context: { hardCap: 1500, softCap: 3200, elasticity: 0.45, degradeMode: 'trimmed' },
 	backlink_context: { hardCap: 1200, softCap: 3000, elasticity: 0.35, degradeMode: 'trimmed' },
 	forward_link_context: { hardCap: 1200, softCap: 3000, elasticity: 0.35, degradeMode: 'trimmed' },
-	active_file: { hardCap: 5000, softCap: 15000, elasticity: 1, degradeMode: 'outline' },
-	manual_file: { hardCap: 4000, softCap: 15000, elasticity: 0.9, degradeMode: 'outline' },
+	active_file: { hardCap: 16000, softCap: 24000, elasticity: 1, degradeMode: 'focused' },
+	manual_file: { hardCap: 16000, softCap: 24000, elasticity: 1, degradeMode: 'focused' },
 	vault_map: { hardCap: 1200, softCap: 3000, elasticity: 0.3, degradeMode: 'trimmed' },
 };
 const MAX_FOLDER_FILES           = 5;
@@ -35,23 +36,26 @@ const MAX_VAULT_INDEX_FILES      = 500;
 
 // For edit tasks: target file gets budget first, secondary context is tightly capped
 const CONTEXT_PRIORITY: Record<string, number> = {
-	agent_md: 0, working_memory: 1, working_memory_structured: 2, selected_text: 3, input_reference: 4,
-	user_preferences: 3, frontmatter_context: 4, retrieved_chunk: 5, active_file: 6, manual_file: 7, backlink_context: 8, forward_link_context: 9, folder: 10, vault_index: 11, vault_map: 12, web_result: 13,
+	active_file: 0, manual_file: 1, selected_text: 2, input_reference: 3,
+	pending_task_plan: 4, agent_md: 5, working_memory: 6, working_memory_structured: 7, user_preferences: 8,
+	frontmatter_context: 9, retrieved_chunk: 10, backlink_context: 11, forward_link_context: 12,
+	folder: 13, vault_index: 14, vault_map: 15, web_result: 16,
 };
 
 const CONTEXT_PRIORITY_EDIT: Record<string, number> = {
 	active_file: 0, manual_file: 1, selected_text: 2, input_reference: 3,
-	working_memory_structured: 4, working_memory: 5, agent_md: 6, user_preferences: 7,
-	retrieved_chunk: 8, frontmatter_context: 9,
+	pending_task_plan: 4, working_memory_structured: 5, working_memory: 6, agent_md: 7, user_preferences: 8,
+	retrieved_chunk: 9, frontmatter_context: 10,
 	backlink_context: 20, forward_link_context: 20, folder: 30, vault_index: 30, vault_map: 99, web_result: 30,
 };
 
 // Tighter caps for secondary context in edit tasks — the file being edited matters most
 const EDIT_BUDGET_OVERRIDES: Partial<Record<string, Partial<ContextBudgetProfile>>> = {
-	active_file:               { hardCap: 8000, softCap: 18000, degradeMode: 'focused' },
-	manual_file:               { hardCap: 7000, softCap: 18000, degradeMode: 'focused' },
+	active_file:               { hardCap: 20000, softCap: 30000, degradeMode: 'trimmed' },
+	manual_file:               { hardCap: 20000, softCap: 30000, degradeMode: 'trimmed' },
 	working_memory_structured: { hardCap: 600,  softCap: 900   },
 	working_memory:            { hardCap: 800,  softCap: 1200  },
+	pending_task_plan:         { hardCap: 2500, softCap: 4000  },
 	agent_md:                  { hardCap: 800,  softCap: 1200  },
 	user_preferences:          { hardCap: 600,  softCap: 900   },
 };
@@ -82,7 +86,7 @@ function focusedText(text: string, query: string, maxChars: number): string {
 		.split(/\s+/)
 		.filter(t => t.length > 3);
 
-	if (!queryTerms.length) return outlineText(text, maxChars);
+	if (!queryTerms.length) return trimText(text, maxChars);
 
 	// Split into heading-bounded sections
 	const lines = text.split('\n');
@@ -104,7 +108,7 @@ function focusedText(text: string, query: string, maxChars: number): string {
 		score: queryTerms.reduce((s, t) => s + (sec.content.toLowerCase().includes(t) ? 1 : 0), 0),
 	}));
 
-	if (scored.every(s => s.score === 0)) return outlineText(text, maxChars);
+	if (scored.every(s => s.score === 0)) return trimText(text, maxChars);
 
 	// Include relevant sections and their immediate neighbors for context
 	const fullSet = new Set<number>();
@@ -156,9 +160,33 @@ function degradeText(text: string, profile: ContextBudgetProfile, maxChars: numb
 	return text;
 }
 
+function isStrongFileContext(type: string): boolean {
+	return type === 'active_file' ||
+		type === 'manual_file' ||
+		type === 'input_reference' ||
+		type === 'selected_text';
+}
+
+function expandStrongFileProfile(
+	type: string,
+	profile: ContextBudgetProfile,
+	maxContextChars: number,
+	usedChars: number,
+): ContextBudgetProfile {
+	if (!isStrongFileContext(type)) return profile;
+	const available = Math.max(0, maxContextChars - usedChars);
+	const dynamicCap = Math.max(profile.hardCap, Math.floor(available * 0.86));
+	return {
+		...profile,
+		hardCap: dynamicCap,
+		softCap: Math.max(profile.softCap, dynamicCap),
+	};
+}
+
 export type CompactBudgetOptions = {
 	intent?: string;
 	query?: string;
+	maxRetrievedChunks?: number;
 };
 
 export function compactContextForBudget(context: ContextItem[], maxContextChars: number, options?: CompactBudgetOptions): ContextItem[] {
@@ -179,13 +207,15 @@ export function compactContextForBudget(context: ContextItem[], maxContextChars:
 	let used = 0;
 	let softProfiles: Array<{ index: number; profile: ContextBudgetProfile }> = [];
 	let retrievedChunkCount = 0;
+	const maxRetrievedChunks = options?.maxRetrievedChunks;
 
 	for (const item of sorted) {
 		if (used >= maxContextChars) break;
 
 		// Edit tasks need targeted chunks, not broad retrieval
-		if (isEdit && item.type === 'retrieved_chunk') {
-			if (retrievedChunkCount >= 2) continue;
+		if (item.type === 'retrieved_chunk') {
+			const limit = maxRetrievedChunks ?? (isEdit ? 2 : undefined);
+			if (limit !== undefined && retrievedChunkCount >= limit) continue;
 			retrievedChunkCount++;
 		}
 
@@ -194,10 +224,21 @@ export function compactContextForBudget(context: ContextItem[], maxContextChars:
 		const profile: ContextBudgetProfile | undefined = isEdit && baseProfile
 			? { ...baseProfile, ...(EDIT_BUDGET_OVERRIDES[item.type] ?? {}) } as ContextBudgetProfile
 			: baseProfile;
+		const effectiveProfile = profile
+			? expandStrongFileProfile(item.type, profile, maxContextChars, used)
+			: undefined;
 
-		if (profile && clone.content) {
-			const effectiveMode = profile.degradeMode === 'full' ? 'trimmed' : profile.degradeMode;
-			clone.content = degradeText(clone.content, { ...profile, degradeMode: effectiveMode }, profile.hardCap, query);
+		if (effectiveProfile && clone.content) {
+			const unchangedSize = JSON.stringify(clone).length;
+			if (!(isStrongFileContext(item.type) && used + unchangedSize <= maxContextChars)) {
+				const effectiveMode = effectiveProfile.degradeMode === 'full' ? 'trimmed' : effectiveProfile.degradeMode;
+				clone.content = degradeText(
+					clone.content,
+					{ ...effectiveProfile, degradeMode: effectiveMode },
+					effectiveProfile.hardCap,
+					query,
+				);
+			}
 		}
 
 		if (clone.type === 'folder' && clone.files) {
@@ -213,12 +254,23 @@ export function compactContextForBudget(context: ContextItem[], maxContextChars:
 				.map(f => ({ path: f.path, name: f.name }));
 		}
 
-		const size = JSON.stringify(clone).length;
+		let size = JSON.stringify(clone).length;
+		if (clone.content && isStrongFileContext(item.type) && used + size > maxContextChars) {
+			const withoutContent = { ...clone, content: '' };
+			const overhead = JSON.stringify(withoutContent).length + 80;
+			const availableContentChars = Math.max(0, maxContextChars - used - overhead);
+			if (availableContentChars > 500) {
+				clone.content = degradeText(clone.content, { ...(effectiveProfile ?? profile!), degradeMode: 'trimmed' }, availableContentChars, query);
+				size = JSON.stringify(clone).length;
+			}
+		}
 		if (used + size > maxContextChars) break;
 		used += size;
 		packed.push(clone);
 		// Don't soft-expand focused items — they're already query-targeted
-		if (profile && profile.degradeMode !== 'focused') softProfiles.push({ index: packed.length - 1, profile });
+		if (effectiveProfile && effectiveProfile.degradeMode !== 'focused') {
+			softProfiles.push({ index: packed.length - 1, profile: effectiveProfile });
+		}
 	}
 
 	const remaining = Math.max(0, maxContextChars - used);

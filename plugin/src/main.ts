@@ -9,6 +9,15 @@ import { getVaultIndex, VaultIndex } from './retrieval/vaultIndex';
 import { getVectorStore } from './retrieval/vectorStore';
 import { getEmbeddingBackend } from './retrieval/embeddings';
 import { getIndexWorkerManager } from './retrieval/indexWorker';
+import { migrateModelId } from './models/modelRegistry';
+
+type ApiKeyProvider = 'openai' | 'anthropic' | 'gemini';
+
+const API_KEY_STORAGE_KEYS: Record<ApiKeyProvider, string> = {
+	openai: 'ai-agent.openai.api-key',
+	anthropic: 'ai-agent.anthropic.api-key',
+	gemini: 'ai-agent.gemini.api-key',
+};
 
 export default class ObsidianAiAgentPlugin extends Plugin {
 	settings: AiAgentSettings;
@@ -27,8 +36,8 @@ export default class ObsidianAiAgentPlugin extends Plugin {
 		this.vaultIndex.setEmbeddingConfig({
 			backend: getEmbeddingBackend(this.settings.embeddingBackend),
 			apiKey:
-				this.settings.embeddingBackend === 'openai' ? this.settings.openaiApiKey :
-				this.settings.embeddingBackend === 'gemini' ? this.settings.geminiApiKey :
+				this.settings.embeddingBackend === 'openai' ? this.getProviderApiKey('openai') :
+				this.settings.embeddingBackend === 'gemini' ? this.getProviderApiKey('gemini') :
 				null,
 			baseUrl: this.settings.embeddingBackend === 'ollama' ? this.settings.ollamaBaseUrl : null,
 		});
@@ -68,6 +77,10 @@ export default class ObsidianAiAgentPlugin extends Plugin {
 	}
 
 	onunload() {
+		if (this.persistTimer !== null) {
+			window.clearTimeout(this.persistTimer);
+			this.persistTimer = null;
+		}
 		if (this.warmupTimer !== null) {
 			window.clearTimeout(this.warmupTimer);
 			this.warmupTimer = null;
@@ -77,7 +90,7 @@ export default class ObsidianAiAgentPlugin extends Plugin {
 			this.workerTimer = null;
 		}
 		getIndexWorkerManager().terminate();
-		void getVectorStore(this.app).save().catch(() => undefined);
+		void this.saveAll().catch(() => undefined);
 	}
 
 	async loadAll() {
@@ -87,15 +100,73 @@ export default class ObsidianAiAgentPlugin extends Plugin {
 		if ('backendUrl' in raw || 'openaiApiKey' in raw) {
 			this.settings = Object.assign({}, DEFAULT_SETTINGS, raw as Partial<AiAgentSettings>);
 			this.chatStore = { ...DEFAULT_CHAT_STORE };
+			this.migrateApiKeysToLocalStorage();
+			this.migrateModelSelections();
 			await this.saveAll();
 			return;
 		}
 
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, (raw['settings'] ?? {}) as Partial<AiAgentSettings>);
 		this.chatStore = Object.assign({}, DEFAULT_CHAT_STORE, (raw['chatStore'] ?? {}) as Partial<ChatStoreData>);
+		const migratedSecrets = this.migrateApiKeysToLocalStorage();
+		const migratedModels = this.migrateModelSelections();
 
 		// Load vault index from its own file; fall back to embedded data for migration
 		await this.loadVaultIndex(raw['retrievalIndex'] as Parameters<VaultIndex['hydrate']>[0] | undefined);
+		if (migratedSecrets || migratedModels) await this.saveAll();
+	}
+
+	getProviderApiKey(provider: ApiKeyProvider): string {
+		const value = this.app.loadLocalStorage(API_KEY_STORAGE_KEYS[provider]);
+		return typeof value === 'string' ? value : '';
+	}
+
+	setProviderApiKey(provider: ApiKeyProvider, value: string) {
+		const trimmed = value.trim();
+		this.app.saveLocalStorage(API_KEY_STORAGE_KEYS[provider], trimmed || null);
+		this.clearProviderApiKeySetting(provider);
+	}
+
+	private migrateApiKeysToLocalStorage(): boolean {
+		let migrated = false;
+		const maybeMigrate = (provider: ApiKeyProvider, value: string) => {
+			if (!value) return;
+			if (!this.getProviderApiKey(provider)) {
+				this.app.saveLocalStorage(API_KEY_STORAGE_KEYS[provider], value);
+			}
+			this.clearProviderApiKeySetting(provider);
+			migrated = true;
+		};
+		maybeMigrate('openai', this.settings.openaiApiKey);
+		maybeMigrate('anthropic', this.settings.anthropicApiKey);
+		maybeMigrate('gemini', this.settings.geminiApiKey);
+		return migrated;
+	}
+
+	private clearProviderApiKeySetting(provider: ApiKeyProvider) {
+		if (provider === 'openai') this.settings.openaiApiKey = '';
+		else if (provider === 'anthropic') this.settings.anthropicApiKey = '';
+		else this.settings.geminiApiKey = '';
+	}
+
+	private migrateModelSelections(): boolean {
+		let migrated = false;
+		const migrate = (modelId: string) => migrateModelId(modelId, this.settings.customModels);
+
+		const settingsModel = migrate(this.settings.lastSelectedModelId);
+		if (settingsModel !== this.settings.lastSelectedModelId) {
+			this.settings.lastSelectedModelId = settingsModel;
+			migrated = true;
+		}
+
+		for (const thread of this.chatStore.threads) {
+			const threadModel = migrate(thread.selectedModelId);
+			if (threadModel !== thread.selectedModelId) {
+				thread.selectedModelId = threadModel;
+				migrated = true;
+			}
+		}
+		return migrated;
 	}
 
 	private async loadVaultIndex(legacyData?: Parameters<VaultIndex['hydrate']>[0]) {
@@ -150,6 +221,8 @@ export default class ObsidianAiAgentPlugin extends Plugin {
 			archived: false,
 			selectedModelId: this.settings.lastSelectedModelId,
 			contextMode: 'active_file',
+			contextModes: ['active_file'],
+			activeFilePath: undefined,
 			manualFilePaths: [],
 			folderPath: undefined,
 			includeAgentMd: true,
@@ -187,6 +260,22 @@ export default class ObsidianAiAgentPlugin extends Plugin {
 		if (!thread) return;
 		thread.archived = true;
 		thread.updatedAt = Date.now();
+		if (this.chatStore.activeThreadId === threadId) this.chatStore.activeThreadId = null;
+		await this.saveAll();
+	}
+
+	async unarchiveThread(threadId: string): Promise<void> {
+		const thread = this.chatStore.threads.find(t => t.id === threadId);
+		if (!thread) return;
+		thread.archived = false;
+		thread.updatedAt = Date.now();
+		await this.saveAll();
+	}
+
+	async deleteThread(threadId: string): Promise<void> {
+		const idx = this.chatStore.threads.findIndex(t => t.id === threadId);
+		if (idx < 0) return;
+		this.chatStore.threads.splice(idx, 1);
 		if (this.chatStore.activeThreadId === threadId) this.chatStore.activeThreadId = null;
 		await this.saveAll();
 	}
@@ -281,8 +370,8 @@ export default class ObsidianAiAgentPlugin extends Plugin {
 		const embeddingConfig = {
 			backend: getEmbeddingBackend(this.settings.embeddingBackend),
 			apiKey:
-				this.settings.embeddingBackend === 'openai' ? this.settings.openaiApiKey :
-				this.settings.embeddingBackend === 'gemini' ? this.settings.geminiApiKey :
+				this.settings.embeddingBackend === 'openai' ? this.getProviderApiKey('openai') :
+				this.settings.embeddingBackend === 'gemini' ? this.getProviderApiKey('gemini') :
 				null,
 			baseUrl: this.settings.embeddingBackend === 'ollama' ? this.settings.ollamaBaseUrl : null,
 		} as const;

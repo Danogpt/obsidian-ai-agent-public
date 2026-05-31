@@ -6,6 +6,9 @@ export type VaultToolName =
 	| 'query_dataview'
 	| 'read_user_preferences'
 	| 'update_user_preferences'
+	| 'save_memory'
+	| 'recall_memory'
+	| 'ask_user'
 	| 'expand_chunk'
 	| 'create_agent_md'
 	| 'write_file'
@@ -26,6 +29,8 @@ export type VaultToolResult = {
 	ok: boolean;
 	result?: unknown;
 	error?: string;
+	cancelled?: boolean;
+	severity?: 'info' | 'warning' | 'error';
 };
 
 export type AgentMode = 'read' | 'suggest' | 'agent';

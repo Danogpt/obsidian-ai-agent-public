@@ -60,6 +60,19 @@ const VAULT_TOOLS_PROMPT = [
 	'</vault_tools>',
 ].join('\n');
 
+const NATIVE_VAULT_TOOLS_PROMPT = [
+	'<vault_tools>',
+	'Du hast Zugriff auf native Tool Calls fuer den Obsidian Vault.',
+	'Nutze Tool Calls statt JSON im Text, wenn du Dateien lesen, suchen, schreiben oder Nutzerfragen klaeren musst.',
+	'Werkzeugregeln:',
+	'- Lies immer zuerst Dateien, bevor du sie aenderst.',
+	'- Erfinde keine Dateiinhalte; nutze read_file wenn du den Inhalt brauchst.',
+	'- Nutze search_vault, wenn der Nutzer ein Thema, eine unklare Datei oder bestehende Notizen im Vault meint, aber du den genauen Pfad noch nicht kennst.',
+	'- Nach spaetestens 2 reinen Leserunden musst du entweder eine strukturierte Plan-Antwort liefern, einen Schreibschritt ausfuehren oder eine normale Antwort mit Zwischenstand geben.',
+	'- Wenn du fertig bist oder keine Tools brauchst, antworte normal im Chat.',
+	'</vault_tools>',
+].join('\n');
+
 function trimText(text: string, limit: number): string {
 	if (!text || text.length <= limit) return text;
 	return text.slice(0, limit) + '\n\n[... gekuerzt wegen Kontextlimit ...]';
@@ -78,19 +91,20 @@ const CONTEXT_PRIORITY: Record<string, number> = {
 	agent_memory: 1,
 	working_memory: 2,
 	working_memory_structured: 3,
-	user_preferences: 4,
-	selected_text: 5,
-	frontmatter_context: 6,
-	input_reference: 7,
-	retrieved_chunk: 8,
-	active_file: 9,
-	manual_file: 10,
-	backlink_context: 11,
-	forward_link_context: 12,
-	folder: 13,
-	vault_index: 14,
-	vault_map: 15,
-	web_result: 16,
+	pending_task_plan: 4,
+	user_preferences: 5,
+	selected_text: 6,
+	active_file: 7,
+	manual_file: 8,
+	input_reference: 9,
+	frontmatter_context: 10,
+	retrieved_chunk: 11,
+	backlink_context: 12,
+	forward_link_context: 13,
+	folder: 14,
+	vault_index: 15,
+	vault_map: 16,
+	web_result: 17,
 };
 
 function formatContextItem(item: ContextItem, remaining: number): [string, number, string[]] {
@@ -164,12 +178,14 @@ export function buildSystemPrompt(req: ChatRequestPayload): string {
 		parts.push('<execution_phase_rules>\nAusfuehrungsphase: plan.\nWenn die Anfrage eine Datei aendern, umschreiben, strukturieren, aktualisieren oder loeschen soll, darfst du noch KEINE write_file-, patch_file- oder delete_file-Calls ausfuehren.\nIn dieser Phase darfst du nur lesen, suchen, auflisten, query_dataview aufrufen und Kontext aufklaeren.\nErst wenn du genug Informationen hast, liefere als answer ein JSON-Objekt:\n{"goal":"...", "complexity":"simple|compound|complex", "steps":[{"id":"1","description":"...","type":"read|search|query|analyze|write|patch|delete|verify|ask_user","target":"path.md","status":"pending"}], "target_files":["path.md"],"operation":"kurze beschreibung","preferred_tool":"patch_file|write_file","safety":"low|medium|high","reasoning":"warum dieses tool","risk_notes":["..."]}\nWaehle complexity=simple fuer eine einzelne Aenderung, compound fuer mehrere Dateien oder Schritte, complex fuer sequentielle Abhaengigkeiten.\nBei reinen Recherche-/Aggregatfragen darf target_files fehlen; steps und goal sind dann Pflicht.\nWaehle preferred_tool=patch_file fuer kleine, eindeutige Aenderungen und preferred_tool=write_file fuer groessere Neufassungen oder wenn ein Patch voraussichtlich fragil waere.\nWenn noch Informationen fehlen, rufe ein passendes Lese-/Such-Tool auf.\nWenn du bereits 1-2 Dateien gelesen hast und die wahrscheinlichen Zieldateien kennst, liefere den Plan statt weiter blind zu lesen.\nVermeide doppelte read_file-Aufrufe auf denselben Pfad innerhalb derselben Anfrage.\n</execution_phase_rules>');
 	}
 	if (req.options.execution_phase === 'execute') {
-		parts.push('<execution_phase_rules>\nAusfuehrungsphase: execute.\nNutze den vorhandenen strukturierten Arbeitsplan aus den Tool-Resultaten und fuehre jetzt die naechsten Planschritte aus.\nVermeide lange Chat-Ausgaben vor der Aenderung. Bevorzuge Tool-Aufrufe.\nBei Dateioperationen folge bevorzugt dem Feld preferred_tool aus dem Plan.\nNutze patch_file fuer gezielte, eindeutige Aenderungen und write_file mit overwrite=true fuer groessere Neufassungen.\nWenn ein Patch zuvor fehlgeschlagen ist und ein frisch gelesener Dateistand vorliegt, passe den Plan an statt denselben kleinen Patch zu wiederholen.\nWenn vorherige Tool-Resultate einen Fehler zeigen, replane den restlichen Ablauf explizit statt blind weiterzumachen.\nWenn du nur noch weitere Dateien lesen wuerdest, ohne unmittelbar einen Schreibschritt oder eine klare Abschlussantwort vorzubereiten, stoppe und gib stattdessen einen kurzen Zwischenstand oder replane.\nWenn search_vault 0 Treffer hatte oder dieselbe Datei schon gelesen wurde, lies sie nicht einfach noch einmal.\n</execution_phase_rules>');
+		parts.push('<execution_phase_rules>\nAusfuehrungsphase: execute.\nNutze den vorhandenen strukturierten Arbeitsplan aus den Tool-Resultaten und fuehre jetzt die naechsten Planschritte aus.\nGib in execute keine neue Plan-JSON-Antwort aus, wenn bereits ein Plan in den Tool-Resultaten akzeptiert wurde. Fuehre stattdessen die naechsten read/write/patch Tools aus.\nVermeide lange Chat-Ausgaben vor der Aenderung. Bevorzuge Tool-Aufrufe.\nBei Dateioperationen folge bevorzugt dem Feld preferred_tool aus dem Plan.\nNutze patch_file fuer gezielte, eindeutige Aenderungen und write_file mit overwrite=true fuer groessere Neufassungen.\nWenn ein Patch zuvor fehlgeschlagen ist und ein frisch gelesener Dateistand vorliegt, passe den Plan an statt denselben kleinen Patch zu wiederholen.\nWenn vorherige Tool-Resultate einen Fehler zeigen, replane den restlichen Ablauf explizit statt blind weiterzumachen.\nWenn du nur noch weitere Dateien lesen wuerdest, ohne unmittelbar einen Schreibschritt oder eine klare Abschlussantwort vorzubereiten, stoppe und gib stattdessen einen kurzen Zwischenstand oder replane.\nWenn search_vault 0 Treffer hatte oder dieselbe Datei schon gelesen wurde, lies sie nicht einfach noch einmal.\n</execution_phase_rules>');
 	}
 	if (req.options.thinking_mode) {
 		parts.push('<reasoning_mode>\nDenke Schritt fuer Schritt, bevor du antwortest.\n</reasoning_mode>');
 	}
-	if (req.options.vault_tools_enabled) parts.push(VAULT_TOOLS_PROMPT);
+	if (req.options.vault_tools_enabled) {
+		parts.push(req.options.native_tool_calling ? NATIVE_VAULT_TOOLS_PROMPT : VAULT_TOOLS_PROMPT);
+	}
 	if (req.options.agent_mode === 'read') {
 		parts.push('<agent_mode_rules>\nAgent-Modus: read. Du darfst nur lesen, suchen und erklaeren. Keine write_file-, patch_file- oder delete_file-Calls.\n</agent_mode_rules>');
 	}

@@ -19,6 +19,7 @@ const SUMMARY_TRIGGER_TOKENS = 2200;
 const MAX_SUMMARY_CHARS = 2400;
 const MAX_TOOL_RESULTS = 3;
 const MAX_TOOL_TEXT = 4000;
+const MAX_READ_TOOL_TEXT = 24000;
 const MAX_TOOL_ERROR = 300;
 const HISTORY_TOOL_BONUS = 500;
 
@@ -537,18 +538,18 @@ export function buildCompactHistory(thread: ChatThread, maxTokenBudget = 2800) {
 	return [...older, ...guaranteed];
 }
 
-function compactUnknownResult(result: unknown): unknown {
-	if (typeof result === 'string') return trim(result, MAX_TOOL_TEXT);
+function compactUnknownResult(result: unknown, textLimit = MAX_TOOL_TEXT): unknown {
+	if (typeof result === 'string') return trim(result, textLimit);
 	if (!result || typeof result !== 'object') return result;
 	if (Array.isArray(result)) {
 		const arrayResult: unknown[] = result;
-		return arrayResult.slice(-2).map(item => compactUnknownResult(item));
+		return arrayResult.slice(-2).map(item => compactUnknownResult(item, textLimit));
 	}
 
 	const clone: Record<string, unknown> = { ...result };
 
 	if (typeof clone['content'] === 'string') {
-		clone['content'] = trim(clone['content'], MAX_TOOL_TEXT);
+		clone['content'] = trim(clone['content'], textLimit);
 	}
 
 	if (Array.isArray(clone['files'])) {
@@ -566,9 +567,33 @@ function compactUnknownResult(result: unknown): unknown {
 }
 
 export function compactToolResults(results: ToolResult[]): ToolResult[] {
-	return results.slice(-MAX_TOOL_RESULTS).map(result => ({
+	const latestOpenAIResponseId = getLatestOpenAIResponseId(results);
+	const keepFromIndex = Math.max(0, results.length - MAX_TOOL_RESULTS);
+	return results.filter((result, index) => {
+		if (index >= keepFromIndex) return true;
+		if (!latestOpenAIResponseId) return false;
+		return getOpenAIResponseId(result) === latestOpenAIResponseId;
+	}).map(result => ({
 		...result,
 		error: result.error ? trim(result.error, MAX_TOOL_ERROR) : result.error,
-		result: compactUnknownResult(result.result),
+		result: compactUnknownResult(
+			result.result,
+			result.tool === 'read_file' || result.tool === 'read_active_file' ? MAX_READ_TOOL_TEXT : MAX_TOOL_TEXT,
+		),
 	}));
+}
+
+function getOpenAIResponseId(result: ToolResult): string | undefined {
+	const value = result.provider_context?.['openai_response_id'];
+	return typeof value === 'string' && value ? value : undefined;
+}
+
+function getLatestOpenAIResponseId(results: ToolResult[]): string | undefined {
+	for (let index = results.length - 1; index >= 0; index--) {
+		const result = results[index];
+		if (!result) continue;
+		const responseId = getOpenAIResponseId(result);
+		if (responseId) return responseId;
+	}
+	return undefined;
 }

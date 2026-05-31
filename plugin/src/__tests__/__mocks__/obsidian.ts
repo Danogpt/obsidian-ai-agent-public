@@ -22,3 +22,5 @@ export class Modal {}
 export class Setting {}
 export class WorkspaceLeaf {}
 export class MarkdownRenderer {}
+
+export function setIcon() {}

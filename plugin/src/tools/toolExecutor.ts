@@ -75,6 +75,13 @@ class AskUserModal extends Modal {
 
 type ConfirmKind = 'write' | 'patch' | 'delete';
 
+class ToolDeniedError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = 'ToolDeniedError';
+	}
+}
+
 class ConfirmModal extends Modal {
 	private resolved = false;
 	private resolve!: (confirmed: boolean) => void;
@@ -253,6 +260,9 @@ export class ToolExecutor {
 						return {
 							id: call.id,
 							tool: call.tool,
+							args: call.args,
+							thought_signature: call.thought_signature,
+							provider_context: call.provider_context,
 							ok: false,
 							error: 'ask_user abgebrochen oder geschlossen.',
 							result: { question, cancelled: true },
@@ -285,18 +295,24 @@ export class ToolExecutor {
 					throw new Error(`Unknown tool: ${call.tool}`);
 			}
 		} catch (err) {
-			new Notice(`Tool failed: ${call.tool}`);
+			const cancelled = err instanceof ToolDeniedError;
+			if (!cancelled) new Notice(`Tool failed: ${call.tool}`);
 			return {
 				id: call.id,
 				tool: call.tool,
+				args: call.args,
+				thought_signature: call.thought_signature,
+				provider_context: call.provider_context,
 				ok: false,
 				error: err instanceof Error ? err.message : String(err),
+				cancelled,
+				severity: cancelled ? 'info' : 'error',
 			};
 		}
 	}
 
 	private ok(call: ToolCall, result: unknown): ToolResult {
-		return { id: call.id, tool: call.tool, ok: true, result };
+		return { id: call.id, tool: call.tool, args: call.args, thought_signature: call.thought_signature, provider_context: call.provider_context, ok: true, result };
 	}
 
 	private ensureCanWrite() {
@@ -324,6 +340,6 @@ export class ToolExecutor {
 			(args['path'] as string | undefined) ?? '(unbekannt)',
 			buildSnippet(kind, args),
 		).openAndWait();
-		if (!confirmed) throw new Error(error);
+		if (!confirmed) throw new ToolDeniedError(error);
 	}
 }

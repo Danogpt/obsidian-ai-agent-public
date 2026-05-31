@@ -4,26 +4,64 @@ function hasStrongEditVerb(text: string): boolean {
 	return /\b(aendere|ändere|bearbeite|ueberarbeite|überarbeite|schreibe|ergaenze|ergänze|aktualisiere|loesche|lösche|ersetze|strukturiere|patch|rewrite)\b/u.test(text);
 }
 
+function asksForPlanningOnly(text: string): boolean {
+	return /\b(plan|route|wanderroute|itinerary|tagesplan|ablauf|kombinier|kombinieren|verbinden|reihenfolge|empfehlung|infos?|informationen)\b/u.test(text) &&
+		/\b(gibt es|hast du|kann man|koennen wir|können wir|wie|wann|wo|welche|was)\b/u.test(text);
+}
+
+function asksForAgentWorkflow(text: string): boolean {
+	return /\b(arbeite das ab|mach das schritt|führe aus|fuehre aus|erstelle und speichere|recherchiere und aktualisiere|suche und schreibe|ändere danach|aendere danach|neuen?\s+ordner|ordner\s+(?:anlegen|erstellen|machen)|mehrere\s+(?:pages|seiten|dateien)|einzelne[nr]?\s+(?:pages|seiten|dateien)|scaffold)\b/u.test(text);
+}
+
 export function classifyTaskComplexity(message: string, context: ContextItem[]): TaskComplexity {
 	const text = message.toLowerCase();
 	const referencedFiles = context.filter(item =>
 		item.type === 'active_file' || item.type === 'manual_file' || item.type === 'input_reference',
 	).length;
+	if (!hasStrongEditVerb(text) && asksForPlanningOnly(text)) {
+		return 'simple';
+	}
 	if (/\b(mehrere|alle dateien|für jede|fuer jede|danach|anschließend|anschliessend|schritt für schritt|step by step)\b/u.test(text)) {
 		return 'complex';
+	}
+	if (/\b(neuen?\s+ordner|ordner\s+(?:anlegen|erstellen|machen)|mehrere\s+(?:pages|seiten|dateien)|einzelne[nr]?\s+(?:pages|seiten|dateien)|pages?\s+(?:anlegen|erstellen|machen|einfügen|einfuegen)|scaffold)\b/u.test(text)) {
+		return 'complex';
+	}
+	if (!hasStrongEditVerb(text) && !asksForAgentWorkflow(text)) {
+		return 'simple';
 	}
 	if (referencedFiles > 1 || /\b(außerdem|ausserdem|zusätzlich|zusaetzlich|sowie|und dann)\b/u.test(text)) {
 		return 'compound';
 	}
-	return hasStrongEditVerb(text) ? 'compound' : 'simple';
+	if (hasStrongEditVerb(text)) return referencedFiles <= 1 ? 'simple' : 'compound';
+	return 'simple';
 }
 
 export function shouldUsePlanner(message: string, context: ContextItem[]): boolean {
-	return classifyTaskComplexity(message, context) !== 'simple';
+	const text = message.toLowerCase();
+	return hasStrongEditVerb(text) || asksForAgentWorkflow(text)
+		? classifyTaskComplexity(message, context) !== 'simple'
+		: false;
+}
+
+function findLastIndex<T>(items: T[], predicate: (item: T) => boolean): number {
+	for (let index = items.length - 1; index >= 0; index--) {
+		const item = items[index];
+		if (item !== undefined && predicate(item)) return index;
+	}
+	return -1;
 }
 
 export function shouldReplanFromToolResults(results: ToolResult[]): { required: boolean; reason?: string } {
-	const recent = results.slice(-3);
+	const lastAcceptedPlanIndex = findLastIndex(results, result => result.ok && result.tool === 'task_plan');
+	const executionResults = lastAcceptedPlanIndex >= 0 ? results.slice(lastAcceptedPlanIndex + 1) : results;
+	const lastSuccessfulMutationIndex = findLastIndex(executionResults, result =>
+		result.ok && (result.tool === 'write_file' || result.tool === 'patch_file' || result.tool === 'delete_file'),
+	);
+	const relevantResults = lastSuccessfulMutationIndex >= 0
+		? executionResults.slice(lastSuccessfulMutationIndex + 1)
+		: executionResults;
+	const recent = relevantResults.slice(-3);
 	for (const result of recent) {
 		if (!result.ok) {
 			return { required: true, reason: `${result.tool} failed: ${result.error ?? 'unknown error'}` };

@@ -1,5 +1,6 @@
-import type { ProviderName } from '../models/modelRegistry';
+import type { ModelReasoningConfig, ProviderName } from '../models/modelRegistry';
 import type { AgentMode } from '../tools/toolTypes';
+import type { UIMode } from '../chat/chatStore';
 
 export type { ProviderName };
 
@@ -10,6 +11,7 @@ export interface ProviderAuth {
 
 export interface ChatOptions {
 	thinking_mode: boolean;
+	reasoning?: ModelReasoningConfig;
 	web_search: boolean;
 	vault_tools_enabled: boolean;
 	stream: boolean;
@@ -22,6 +24,9 @@ export interface ChatOptions {
 	edit_format_hint?: string;
 	embedding_backend?: 'local' | 'openai' | 'gemini' | 'ollama';
 	enable_style_critique?: boolean;
+	native_tool_calling?: boolean;
+	ui_mode?: UIMode;
+	allowed_tool_names?: string[];
 }
 
 export type ContextItemType =
@@ -29,6 +34,7 @@ export type ContextItemType =
 	| 'agent_memory'
 	| 'working_memory'
 	| 'working_memory_structured'
+	| 'pending_task_plan'
 	| 'user_preferences'
 	| 'active_file'
 	| 'selected_text'
@@ -78,14 +84,21 @@ export interface ToolCall {
 	tool: string;
 	args: Record<string, unknown>;
 	reason?: string;
+	thought_signature?: string;
+	provider_context?: Record<string, unknown>;
 }
 
 export interface ToolResult {
 	id: string;
 	tool: string;
+	args?: Record<string, unknown>;
+	thought_signature?: string;
+	provider_context?: Record<string, unknown>;
 	ok: boolean;
 	result?: unknown;
 	error?: string;
+	cancelled?: boolean;
+	severity?: 'info' | 'warning' | 'error';
 }
 
 export type StepType = 'read' | 'search' | 'analyze' | 'write' | 'patch' | 'delete' | 'verify';
@@ -162,6 +175,16 @@ export interface ChatRequestPayload {
 	options: ChatOptions;
 }
 
+export interface ProviderUsage {
+	inputTokens?: number;
+	outputTokens?: number;
+	reasoningTokens?: number;
+	cachedTokens?: number;
+	webSearchRequests?: number;
+	toolCallCount?: number;
+	durationMs?: number;
+}
+
 export interface ChatResponsePayload {
 	answer: string | null;
 	tool_calls: ToolCall[];
@@ -169,4 +192,6 @@ export interface ChatResponsePayload {
 	model: string;
 	events: ChatEvent[];
 	sources: string[];
+	response_id?: string;
+	usage?: ProviderUsage;
 }

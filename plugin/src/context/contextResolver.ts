@@ -1,8 +1,11 @@
 import { App, TFile } from 'obsidian';
 import type { ContextItem } from '../agent/types';
 import type { ChatThread, ContextMode } from '../chat/chatStore';
+import { getEffectiveModes } from '../chat/chatStore';
+import type { RouterResult } from '../agent/intentRouter';
 import { llmRerankSearchResults, type LlmCallFn } from '../retrieval/reranker';
 import { getVaultIndex } from '../retrieval/vaultIndex';
+import type { VaultSearchResult } from '../retrieval/types';
 import { FileReferenceResolver } from './fileReferenceResolver';
 import { AGENT_MEMORY_PATH, ObsidianVaultTools, USER_PREFERENCES_PATH } from '../tools/obsidianVaultTools';
 
@@ -29,6 +32,21 @@ type RetrievalPolicy = {
 	retrievalMode: 'none' | 'fallback' | 'primary';
 };
 
+type RetrievalConfidence = 'low' | 'medium' | 'high';
+
+type RetrievalGateDecision<T> = {
+	hit: T;
+	confidence: RetrievalConfidence;
+	score: number;
+	include: boolean;
+	shortReferenceOnly: boolean;
+	reason: string;
+};
+
+export type ResolveContextOptions = {
+	route?: RouterResult;
+};
+
 type ParsedMentions = {
 	noteRefs: string[];
 	folders: string[];
@@ -43,6 +61,14 @@ type ParsedFrontmatterFilters = {
 	project?: string;
 	topic?: string;
 };
+
+export function shouldCollectFrontmatterContextForMessage(userMessage: string, mentions: Pick<ParsedMentions, 'tags' | 'vault'>): boolean {
+	const text = userMessage.toLowerCase();
+	return /\b(dataview|bases|table|liste|tasks?|auflisten|gruppier|frontmatter|alias|template|schema|templater)\b/u.test(text)
+		|| /\b(?:status|type|project|projekt|topic|tag)\s*[:=]/u.test(text)
+		|| mentions.tags.length > 0
+		|| mentions.vault;
+}
 
 export function shouldUseLlmRerankForIntent(
 	intent: QueryIntent,
@@ -78,6 +104,176 @@ export function diversifyRetrievedHitsByPath<T extends { path: string }>(
 	return diversified;
 }
 
+function clamp01(value: number): number {
+	if (!Number.isFinite(value)) return 0;
+	return Math.max(0, Math.min(1, value));
+}
+
+function hasReason(hit: Pick<VaultSearchResult, 'reasons'>, prefix: string): boolean {
+	return (hit.reasons ?? []).some(reason => reason === prefix || reason.startsWith(prefix));
+}
+
+function getRetrievalGateThresholds(intent: QueryIntent): { medium: number; high: number } {
+	if (intent === 'vault_research') return { medium: 0.38, high: 0.68 };
+	if (intent === 'navigation') return { medium: 0.42, high: 0.7 };
+	if (intent === 'edit') return { medium: 0.58, high: 0.78 };
+	return { medium: 0.5, high: 0.74 };
+}
+
+export function scoreRetrievedHitConfidence(
+	hit: Pick<VaultSearchResult, 'score' | 'reasons' | 'retrieval_scores'>,
+	topScore: number,
+): number {
+	const scores = hit.retrieval_scores;
+	const relative = topScore > 0 ? clamp01(hit.score / topScore) : 0;
+	let confidence = relative * 0.28;
+
+	if (hasReason(hit, 'keyword')) confidence += 0.2;
+	if (hasReason(hit, 'semantic')) confidence += 0.14;
+	if (hasReason(hit, 'semantic_chunk')) confidence += 0.12;
+	if (hasReason(hit, 'heading:')) confidence += 0.12;
+	if (hasReason(hit, 'llm-rerank')) confidence += 0.16;
+	if (hasReason(hit, 'rerank')) confidence += 0.08;
+	if (hasReason(hit, 'same_folder')) confidence += 0.05;
+	if (hasReason(hit, 'shared_tags:')) confidence += 0.05;
+
+	const dense = scores?.dense;
+	if (typeof dense === 'number') {
+		if (dense >= 0.45 && dense <= 1) confidence += 0.18;
+		else if (dense >= 0.3 && dense <= 1) confidence += 0.08;
+	}
+	const chunk = scores?.chunk;
+	if (typeof chunk === 'number' && chunk > 0) confidence += Math.min(0.16, Math.log1p(chunk) / 30);
+	const rerank = scores?.rerank;
+	if (typeof rerank === 'number' && rerank > 0.18) confidence += 0.08;
+
+	return Number(clamp01(confidence).toFixed(3));
+}
+
+export function applyRetrievalConfidenceGate<T extends Pick<VaultSearchResult, 'score' | 'reasons' | 'retrieval_scores'>>(
+	hits: T[],
+	intent: QueryIntent,
+): RetrievalGateDecision<T>[] {
+	const topScore = hits[0]?.score ?? 0;
+	const thresholds = getRetrievalGateThresholds(intent);
+	return hits.map(hit => {
+		const score = scoreRetrievedHitConfidence(hit, topScore);
+		const confidence: RetrievalConfidence =
+			score >= thresholds.high ? 'high' :
+			score >= thresholds.medium ? 'medium' :
+			'low';
+		return {
+			hit,
+			confidence,
+			score,
+			include: confidence !== 'low',
+			shortReferenceOnly: confidence === 'medium',
+			reason: confidence === 'low'
+				? `below medium floor ${thresholds.medium}`
+				: confidence === 'medium'
+					? `below high floor ${thresholds.high}`
+					: `above high floor ${thresholds.high}`,
+		};
+	});
+}
+
+export function hasExplicitFolderScope(
+	effectiveModes: ContextMode[],
+	folderPath: string | undefined,
+	contextItems: Pick<ContextItem, 'type'>[],
+): boolean {
+	return contextItems.some(item => item.type === 'folder') ||
+		(effectiveModes.includes('folder') && Boolean(folderPath));
+}
+
+export function shouldSkipAllAutomaticContext(effectiveModes: ContextMode[]): boolean {
+	return effectiveModes.includes('none') && effectiveModes.length === 1;
+}
+
+function applyRoutePolicyForModes(
+	policy: RetrievalPolicy,
+	route: RouterResult | undefined,
+	effectiveModes: ContextMode[],
+	folderPath: string | undefined,
+): RetrievalPolicy {
+	if (!route) return policy;
+	const hasVaultMode = effectiveModes.includes('vault');
+	const noneOnly = effectiveModes.includes('none') && effectiveModes.length === 1;
+	const maxRetrievedChunks = Math.max(0, route.maxRetrievedChunks);
+	const routed: RetrievalPolicy = {
+		...policy,
+		retrievedChunkCount: maxRetrievedChunks,
+	};
+	if (noneOnly) {
+		return {
+			...routed,
+			retrievedChunkCount: 0,
+			includeVaultMap: false,
+			includeLinkedContext: false,
+			retrievalMode: 'none',
+		};
+	}
+	if (route.mode === 'ask') {
+		return {
+			...routed,
+			includeVaultMap: hasVaultMode ? routed.includeVaultMap : false,
+			includeLinkedContext: false,
+			retrievalMode: hasVaultMode ? 'primary' : 'fallback',
+		};
+	}
+	if (route.mode === 'edit') {
+		return {
+			...routed,
+			retrievedChunkCount: Math.min(maxRetrievedChunks, 3),
+			retrievedChunkMaxChars: Math.min(routed.retrievedChunkMaxChars, 4_000),
+			includeVaultMap: false,
+			includeLinkedContext: false,
+			retrievalMode: 'fallback',
+		};
+	}
+	if (route.mode === 'plan' || route.mode === 'agent') {
+		const hasFocusedContext =
+			effectiveModes.includes('active_file') ||
+			effectiveModes.includes('selected_text') ||
+			effectiveModes.includes('manual_files') ||
+			(effectiveModes.includes('folder') && Boolean(folderPath));
+		return {
+			...routed,
+			includeVaultMap: hasVaultMode,
+			includeLinkedContext: hasVaultMode && route.mode === 'agent',
+			retrievalMode: hasVaultMode || !hasFocusedContext ? 'primary' : 'fallback',
+		};
+	}
+	return routed;
+}
+
+export function resolveRouteRetrievalPolicyForTest(
+	route: RouterResult,
+	thread: Pick<ChatThread, 'contextMode' | 'contextModes' | 'folderPath'>,
+): Pick<RetrievalPolicy, 'retrievalMode' | 'includeVaultMap' | 'includeLinkedContext' | 'retrievedChunkCount'> {
+	const effectiveModes = getEffectiveModes(thread as ChatThread);
+	const base: RetrievalPolicy = {
+		intent: effectiveModes.includes('vault') ? 'vault_research' : 'fact_lookup',
+		activeFileMaxChars: DEFAULT_ACTIVE_FILE_MAX,
+		manualFileMaxChars: 15_000,
+		inputReferenceMaxChars: 15_000,
+		retrievedChunkCount: 3,
+		retrievedChunkMaxChars: 8_000,
+		vaultMapLimit: 10,
+		linkContextLimit: 4,
+		includeVaultMap: effectiveModes.includes('vault'),
+		includeLinkedContext: false,
+		retrievalMode: effectiveModes.includes('vault') ? 'primary' : 'fallback',
+	};
+	const policy = applyRoutePolicyForModes(base, route, effectiveModes, thread.folderPath);
+	return {
+		retrievalMode: policy.retrievalMode,
+		includeVaultMap: policy.includeVaultMap,
+		includeLinkedContext: policy.includeLinkedContext,
+		retrievedChunkCount: policy.retrievedChunkCount,
+	};
+}
+
 export class ContextResolver {
 	private tools: ObsidianVaultTools;
 	private fileRefResolver: FileReferenceResolver;
@@ -102,13 +298,22 @@ export class ContextResolver {
 		return this.app.workspace.getActiveFile()?.path;
 	}
 
-	async resolveContext(thread: ChatThread, userMessage: string): Promise<ContextItem[]> {
+	private getThreadActivePath(thread: ChatThread): string | undefined {
+		return getEffectiveModes(thread).includes('active_file')
+			? this.getActivePath()
+			: undefined;
+	}
+
+	async resolveContext(thread: ChatThread, userMessage: string, options: ResolveContextOptions = {}): Promise<ContextItem[]> {
 		const context: ContextItem[] = [];
-		this.rememberRecentContextPaths(thread);
-		const intent = this.detectIntent(thread, userMessage);
+		const activePath = this.getThreadActivePath(thread);
+		this.rememberRecentContextPaths(thread, activePath);
+		const intent = options.route ? this.intentFromRoute(options.route) : this.detectIntent(thread, userMessage);
 		this._lastIntent = intent;
-		const policy = this.buildPolicy(intent, thread);
+		const policy = this.applyRoutePolicy(this.buildPolicy(intent, thread), options.route, thread);
 		const mentions = this.parseMentions(userMessage);
+		const effectiveModes = getEffectiveModes(thread).filter(m => m !== 'none');
+		if (shouldSkipAllAutomaticContext(getEffectiveModes(thread))) return [];
 
 		if (thread.includeAgentMd !== false) {
 			const agentMd = await this.collectAgentMd();
@@ -121,21 +326,30 @@ export class ContextResolver {
 		const agentMemory = await this.collectAgentMemory(userMessage);
 		if (agentMemory) context.push(agentMemory);
 
-		const modeItems = await this.collectByMode(
-			thread.contextMode ?? 'active_file',
-			thread.manualFilePaths ?? [],
-			thread.folderPath,
-			userMessage,
-			policy,
-		);
-		context.push(...modeItems);
+		const seenModeItemPaths = new Set<string>();
+		for (const m of effectiveModes) {
+			const items = await this.collectByMode(
+				m,
+				this.getThreadActivePath(thread),
+				thread.manualFilePaths ?? [],
+				thread.folderPath,
+				userMessage,
+				policy,
+			);
+			for (const item of items) {
+				const key = item.path ?? item.label;
+				if (seenModeItemPaths.has(key)) continue;
+				seenModeItemPaths.add(key);
+				context.push(item);
+			}
+		}
 
-		const refItems = await this.collectInputRefs(userMessage, context, policy);
+		const refItems = await this.collectInputRefs(userMessage, context, policy, activePath);
 		context.push(...refItems);
 
-		const mentionItems = await this.collectMentionContext(mentions, context, policy);
+		const mentionItems = await this.collectMentionContext(mentions, context, policy, activePath);
 		context.push(...mentionItems);
-		const hasExplicitFolderContext = mentionItems.some(item => item.type === 'folder');
+		const hasExplicitFolderContext = hasExplicitFolderScope(effectiveModes, thread.folderPath, mentionItems);
 
 		const retrievedItems = await this.collectRetrievedChunks(
 			thread,
@@ -156,16 +370,16 @@ export class ContextResolver {
 		}
 
 		if (policy.includeVaultMap && !hasExplicitFolderContext) {
-			const vaultMap = await this.collectVaultMap(userMessage, context, policy);
+			const vaultMap = await this.collectVaultMap(thread, userMessage, context, policy);
 			if (vaultMap) context.push(vaultMap);
 		}
 
 		return context;
 	}
 
-	getReferencedFilePaths(userMessage: string): string[] {
+	getReferencedFilePaths(userMessage: string, activePathOverride?: string): string[] {
 		const mentions = this.parseMentions(userMessage);
-		const activePath = this.getActivePath();
+		const activePath = activePathOverride ?? this.getActivePath();
 		return Array.from(new Set(
 			[
 				...this.fileRefResolver.findFileReferences(userMessage),
@@ -227,6 +441,7 @@ export class ContextResolver {
 
 	private async collectByMode(
 		mode: ContextMode,
+		activeFilePath: string | undefined,
 		manualPaths: string[],
 		folderPath: string | undefined,
 		userMessage: string,
@@ -234,7 +449,9 @@ export class ContextResolver {
 	): Promise<ContextItem[]> {
 		switch (mode) {
 			case 'active_file': {
-				const file = await this.tools.readActiveFile();
+				const file = activeFilePath
+					? await this.readPinnedActiveFile(activeFilePath)
+					: await this.tools.readActiveFile();
 				if (!file) return [];
 				const content = await this.getPromptContent(
 					file.path,
@@ -302,10 +519,19 @@ export class ContextResolver {
 		}
 	}
 
+	private async readPinnedActiveFile(path: string): Promise<{ path: string; name: string; content: string } | null> {
+		try {
+			return await this.tools.readFile(path);
+		} catch {
+			return null;
+		}
+	}
+
 	private async collectInputRefs(
 		userMessage: string,
 		existing: ContextItem[],
 		policy: RetrievalPolicy,
+		activePath: string | undefined,
 	): Promise<ContextItem[]> {
 		const refs = this.fileRefResolver.findFileReferences(userMessage);
 		const items: ContextItem[] = [];
@@ -316,7 +542,7 @@ export class ContextResolver {
 		);
 
 		for (const ref of refs) {
-			const file = this.fileRefResolver.resolveToFile(ref, this.getActivePath());
+			const file = this.fileRefResolver.resolveToFile(ref, activePath);
 			if (!file || seenPaths.has(file.path)) continue;
 
 			try {
@@ -336,6 +562,7 @@ export class ContextResolver {
 		mentions: ParsedMentions,
 		existing: ContextItem[],
 		policy: RetrievalPolicy,
+		activePath: string | undefined,
 	): Promise<ContextItem[]> {
 		const items: ContextItem[] = [];
 		const seenPaths = new Set(
@@ -343,7 +570,7 @@ export class ContextResolver {
 		);
 
 		for (const ref of mentions.noteRefs) {
-			const file = this.fileRefResolver.resolveToFile(ref, this.getActivePath());
+			const file = this.fileRefResolver.resolveToFile(ref, activePath);
 			if (!file || seenPaths.has(file.path)) continue;
 			try {
 				const raw = await this.app.vault.cachedRead(file);
@@ -387,12 +614,13 @@ export class ContextResolver {
 	}
 
 	private async collectVaultMap(
+		thread: ChatThread,
 		userMessage: string,
 		existing: ContextItem[],
 		policy: RetrievalPolicy,
 	): Promise<ContextItem | null> {
-		const activePath = this.getActivePath();
-		const referencedPaths = this.getReferencedFilePaths(userMessage);
+		const activePath = this.getThreadActivePath(thread);
+		const referencedPaths = this.getReferencedFilePaths(userMessage, activePath);
 		const hasBroadQuestion = userMessage.trim().split(/\s+/).length >= 4;
 		const hasVaultManifest = existing.some(item => item.type === 'vault_index');
 		if (!hasBroadQuestion && !hasVaultManifest) return null;
@@ -432,14 +660,14 @@ export class ContextResolver {
 		);
 		if (policy.retrievalMode === 'fallback' && hasStrongFileContext) return [];
 
-		const activePath = this.getActivePath();
+		const activePath = this.getThreadActivePath(thread);
 		const excludePaths = existing
 			.map(item => item.path)
 			.filter((path): path is string => Boolean(path));
 		let hits = await getVaultIndex(this.app).search(normalizedQuery, {
 			limit: policy.retrievedChunkCount,
 			activePath,
-			referencedPaths: this.getReferencedFilePaths(userMessage),
+			referencedPaths: this.getReferencedFilePaths(userMessage, activePath),
 			recentPaths: this.recentPaths,
 			folderPath: thread.folderPath,
 			excludePaths,
@@ -458,20 +686,29 @@ export class ContextResolver {
 
 		// Diversify: limit repeated chunks from the same file before moving on.
 		hits = diversifyRetrievedHitsByPath(hits, policy.intent, policy.retrievedChunkCount);
+		const gatedHits = applyRetrievalConfidenceGate(hits, policy.intent)
+			.filter(decision => decision.include)
+			.slice(0, policy.retrievedChunkCount);
 
 		const items: ContextItem[] = [];
-		for (const hit of hits) {
-			const content = hit.chunk_id
+		for (const decision of gatedHits) {
+			const { hit } = decision;
+			const maxChars = decision.shortReferenceOnly
+				? Math.min(policy.retrievedChunkMaxChars, 1_000)
+				: policy.retrievedChunkMaxChars;
+			const content = decision.shortReferenceOnly
+				? this.buildRetrievedShortReference(hit)
+				: hit.chunk_id
 				? await getVaultIndex(this.app).buildPromptContentForChunk(
 					hit.path,
 					hit.chunk_id,
 					normalizedQuery,
-					policy.retrievedChunkMaxChars,
+					maxChars,
 				)
 				: await getVaultIndex(this.app).buildPromptContent(
 					hit.path,
 					normalizedQuery,
-					policy.retrievedChunkMaxChars,
+					maxChars,
 				);
 			if (!content) continue;
 			items.push({
@@ -496,11 +733,24 @@ export class ContextResolver {
 					score_dense: hit.retrieval_scores?.dense !== undefined ? Number(hit.retrieval_scores.dense.toFixed(3)) : undefined,
 					score_graph: hit.retrieval_scores?.graph !== undefined ? Number(hit.retrieval_scores.graph.toFixed(3)) : undefined,
 					score_rerank: hit.retrieval_scores?.rerank !== undefined ? Number(hit.retrieval_scores.rerank.toFixed(3)) : undefined,
+					retrieval_confidence: decision.confidence,
+					confidence_score: decision.score,
+					confidence_gate: decision.reason,
+					short_reference_only: decision.shortReferenceOnly,
 				},
 			});
 		}
 
 		return items;
+	}
+
+	private buildRetrievedShortReference(hit: VaultSearchResult): string {
+		const lines = [
+			`Kurzreferenz aus ${hit.path}`,
+			hit.heading ? `Abschnitt: ${hit.heading}` : '',
+			hit.snippet.trim(),
+		].filter(Boolean);
+		return lines.join('\n\n').slice(0, 1_000);
 	}
 
 	private async collectFrontmatterContext(
@@ -509,11 +759,7 @@ export class ContextResolver {
 		existing: ContextItem[],
 		mentions: ParsedMentions,
 	): Promise<ContextItem | null> {
-		const wantsStructuredQuery =
-			/\b(dataview|bases|table|liste|tasks?|auflisten|gruppier|status|type|frontmatter|alias|projekt|project|topic|tag|template|schema|templater)\b/u.test(userMessage.toLowerCase())
-			|| mentions.tags.length > 0
-			|| mentions.vault;
-		if (!wantsStructuredQuery) return null;
+		if (!shouldCollectFrontmatterContextForMessage(userMessage, mentions)) return null;
 
 		const filters = this.parseFrontmatterFilters(userMessage, mentions);
 		const focusedPaths = existing
@@ -530,7 +776,7 @@ export class ContextResolver {
 			project: filters.project,
 			topic: filters.topic,
 			paths: useScopedPaths ? focusedPaths : undefined,
-			limit: thread.contextMode === 'vault' || mentions.vault ? 18 : 10,
+			limit: getEffectiveModes(thread).includes('vault') || mentions.vault ? 18 : 10,
 		});
 		if (!content) return null;
 		const schema = await getVaultIndex(this.app).buildFrontmatterSchemaSummary(
@@ -667,18 +913,18 @@ export class ContextResolver {
 		return filters;
 	}
 
-	private rememberRecentContextPaths(thread: ChatThread) {
+	private rememberRecentContextPaths(thread: ChatThread, activePath: string | undefined) {
 		const recent = thread.messages
 			.slice(-8)
-			.flatMap(message => this.getReferencedFilePaths(message.content))
+			.flatMap(message => this.getReferencedFilePaths(message.content, activePath))
 			.slice(-8);
 		this.recentPaths = Array.from(new Set(recent)).slice(-6);
 	}
 
 	private detectIntent(thread: ChatThread, userMessage: string): QueryIntent {
 		const text = userMessage.toLowerCase();
-		const contextMode = thread.contextMode ?? 'active_file';
-		const referencedPaths = this.getReferencedFilePaths(userMessage);
+		const effectiveModes = getEffectiveModes(thread);
+		const referencedPaths = this.getReferencedFilePaths(userMessage, this.getThreadActivePath(thread));
 		const mentions = this.parseMentions(userMessage);
 
 		if (/\b(aendere|bearbeite|ueberarbeite|schreibe|ergaenze|aktualisiere|loesche|ersetze|patch)\b/u.test(text)) {
@@ -691,7 +937,7 @@ export class ContextResolver {
 
 		if (
 			mentions.vault ||
-			contextMode === 'vault' ||
+			effectiveModes.includes('vault') ||
 			/\b(vault|ueberblick|gesamt|projektweit|vergleich|recherche|analysiere den vault|quer ueber)\b/u.test(text)
 		) {
 			return 'vault_research';
@@ -707,7 +953,20 @@ export class ContextResolver {
 		return 'fact_lookup';
 	}
 
-	private buildPolicy(intent: QueryIntent, _thread: ChatThread): RetrievalPolicy {
+	private intentFromRoute(route: RouterResult): QueryIntent {
+		if (route.mode === 'edit') return 'edit';
+		if (route.mode === 'agent') return 'vault_research';
+		if (route.mode === 'plan') return 'fact_lookup';
+		return 'fact_lookup';
+	}
+
+	private applyRoutePolicy(policy: RetrievalPolicy, route: RouterResult | undefined, thread: ChatThread): RetrievalPolicy {
+		return applyRoutePolicyForModes(policy, route, getEffectiveModes(thread), thread.folderPath);
+	}
+
+	private buildPolicy(intent: QueryIntent, thread: ChatThread): RetrievalPolicy {
+		const effectiveModes = getEffectiveModes(thread);
+		const hasFileContext = effectiveModes.includes('active_file') || effectiveModes.includes('selected_text');
 		const base: RetrievalPolicy = {
 			intent,
 			activeFileMaxChars: DEFAULT_ACTIVE_FILE_MAX,
@@ -777,17 +1036,34 @@ export class ContextResolver {
 					linkContextLimit: 3,
 					includeVaultMap: false,
 					includeLinkedContext: false,
-					retrievalMode: 'primary',
+					retrievalMode: hasFileContext
+						? 'fallback'
+						: 'primary',
 				};
 		}
 	}
 
 	getContextLabel(thread: ChatThread): string {
-		const mode = thread.contextMode ?? 'active_file';
+		const modes = getEffectiveModes(thread);
+		if (modes.length > 1) {
+			return modes.map(mode => {
+				if (mode === 'active_file') {
+					const file = this.getActivePath() ? this.app.vault.getAbstractFileByPath(this.getActivePath()!) : null;
+					return file instanceof TFile ? file.basename : 'Aktuelle Datei';
+				}
+				if (mode === 'manual_files') return `${(thread.manualFilePaths ?? []).length} Dateien`;
+				if (mode === 'folder') return thread.folderPath ?? 'Ordner';
+				if (mode === 'selected_text') return 'Markierter Text';
+				if (mode === 'vault') return 'Vault';
+				return 'Kein Kontext';
+			}).join(' + ');
+		}
+		const mode = modes[0] ?? 'active_file';
 		switch (mode) {
 			case 'active_file': {
-				const file = this.app.workspace.getActiveFile();
-				return file ? file.basename : 'keine aktive Datei';
+				const path = this.getThreadActivePath(thread);
+				const file = path ? this.app.vault.getAbstractFileByPath(path) : null;
+				return file instanceof TFile ? file.basename : 'keine aktive Datei';
 			}
 			case 'selected_text':
 				return 'Markierter Text';

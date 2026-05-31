@@ -1,6 +1,9 @@
 import type { ProviderName } from '../models/modelRegistry';
+import type { TaskPlan } from '../agent/types';
 
 export type ContextMode = 'active_file' | 'selected_text' | 'manual_files' | 'folder' | 'vault' | 'none';
+
+export type UIMode = 'ask' | 'edit' | 'agent' | 'plan';
 
 export type ChatMessage = {
 	id: string;
@@ -71,7 +74,10 @@ export type ChatThread = {
 	selectedModelId: string;
 
 	// Context state (optional for backwards-compat with old saved threads)
-	contextMode?: ContextMode;
+	uiMode?: UIMode;
+	contextMode?: ContextMode;       // legacy single-mode — use getEffectiveModes()
+	contextModes?: ContextMode[];    // multi-mode (new); wins over contextMode when set
+	activeFilePath?: string;         // optional pinned path — leave undefined to follow workspace
 	manualFilePaths?: string[];
 	folderPath?: string;
 	includeAgentMd?: boolean;
@@ -79,6 +85,8 @@ export type ChatThread = {
 	workingSummaryUpdatedAt?: number;
 	archivedMessageCount?: number;
 	workingMemoryData?: WorkingMemoryData;
+	pendingTaskPlan?: TaskPlan;
+	pendingTaskPlanCreatedAt?: number;
 
 	messages: ChatMessage[];
 };
@@ -95,4 +103,16 @@ export const DEFAULT_CHAT_STORE: ChatStoreData = {
 
 export function newMessageId(): string {
 	return Date.now().toString(36) + Math.random().toString(36).slice(2);
+}
+
+/** Returns the active context modes for a thread, handling legacy single-mode threads. */
+export function getEffectiveModes(thread: ChatThread): ContextMode[] {
+	if (thread.contextModes?.length) return thread.contextModes;
+	return [thread.contextMode ?? 'active_file'];
+}
+
+/** Persist a multi-mode selection, clearing the legacy field for consistency. */
+export function setEffectiveModes(thread: ChatThread, modes: ContextMode[]): void {
+	thread.contextModes = modes;
+	thread.contextMode = modes[0];  // keep legacy field in sync for old code paths
 }

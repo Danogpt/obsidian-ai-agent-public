@@ -23,15 +23,6 @@ function buildMutationSummary(paths: string[], language: AiAgentSettings['defaul
 
 function runLocalStyleCritique(text: string, settings: AiAgentSettings): string {
 	let next = collapseWhitespace(text);
-	const shouldShorten =
-		settings.answerPreference === 'concise_actions' ||
-		settings.writingStyle === 'concise' ||
-		settings.writingStyle === 'executive';
-
-	if (shouldShorten && next.length > 1400) {
-		const paragraphs = next.split(/\n{2,}/).map(part => part.trim()).filter(Boolean);
-		next = paragraphs.slice(0, 4).join('\n\n');
-	}
 
 	if (
 		(settings.taskProfile === 'research' || settings.taskProfile === 'writing') &&
@@ -61,7 +52,9 @@ export function postCheckAssistantAnswer(
 	}
 
 	if (settings.agentMode === 'agent' && (meta.mutatedPaths?.length ?? 0) > 0) {
-		return buildMutationSummary(meta.mutatedPaths ?? [], settings.defaultLanguage);
+		const mutationSummary = buildMutationSummary(meta.mutatedPaths ?? [], settings.defaultLanguage);
+		if (!next) return mutationSummary;
+		if (/^(erledigt|done|aktualisiert|updated)[:.! ]*$/i.test(next)) return mutationSummary;
 	}
 
 	if (settings.enableStyleCritique) {
